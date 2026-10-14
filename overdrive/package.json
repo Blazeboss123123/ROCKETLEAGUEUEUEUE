@@ -1,0 +1,13 @@
+{
+  "name": "project-overdrive",
+  "version": "1.0.0",
+  "description": "Rocket-car football with an authoritative multiplayer server. Zero dependencies.",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node server/server.js",
+    "test": "node --test tests/*.test.js",
+    "build": "node tools/build-artifact.mjs && node tools/build-artifact.mjs --local-three"
+  },
+  "license": "UNLICENSED"
+}

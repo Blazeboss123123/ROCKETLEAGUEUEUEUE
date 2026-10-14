@@ -1,0 +1,9 @@
+# One-click deploy on Render (https://render.com): New → Blueprint → pick this repo.
+services:
+  - type: web
+    name: project-overdrive
+    runtime: node
+    plan: free
+    buildCommand: "true"
+    startCommand: node server/server.js
+    healthCheckPath: /status
