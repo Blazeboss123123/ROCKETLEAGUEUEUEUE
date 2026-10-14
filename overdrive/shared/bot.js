@@ -60,7 +60,7 @@ export class Bot {
     const car = world.car(this.id);
     const inp = this.input;
     Object.assign(inp, neutralInput());
-    if (!car || car.frozen) return inp;
+    if (!car || car.frozen || car.demoT > 0) return inp;
     const m = world.match;
     if (m.state === 'ended' || m.state === 'waiting') return inp;
     const dt = world.dt;
@@ -69,6 +69,15 @@ export class Bot {
     // continue scripted actions first
     if (this.action) { this.runAction(world, car, inp, dt); if (this.action) return inp; }
 
+    // pinned against a wall or post while trying to drive: back out and turn the other way
+    const fwdSpeed = car.vel.dot(car.fwd);
+    if (car.onGround && Math.abs(fwdSpeed) < 1.2 && this.lastThrottle > 0.5) this.stuckT = (this.stuckT || 0) + dt;
+    else this.stuckT = 0;
+    if (this.stuckT > 0.45) { this.stuckT = 0; this.start('unstick', { steer: -(this.lastSteer || 1) }); this.runAction(world, car, inp, dt); return inp; }
+
+    const p0 = this.plan;
+    if (p0 && p0.padIndex !== undefined && (world.pads[p0.padIndex] > 0 || car.boost >= 95)) this.nextThink = 0;
+    if (p0 && p0.kind === 'position' && Math.hypot(p0.x - car.pos.x, p0.z - car.pos.z) < 3 && t >= this.nextThink - this.cfg.reaction * 0.5) this.nextThink = 0;
     if (t >= this.nextThink || !this.plan) {
       this.nextThink = t + this.cfg.reaction * (0.7 + 0.6 * this.rand());
       this.noise = (this.rand() - 0.5) * 2 * this.cfg.aimNoise;
@@ -77,6 +86,7 @@ export class Bot {
     const plan = this.plan;
     if (!car.onGround) { this.airRecover(car, inp, plan); return inp; }
     this.drive(world, car, plan, inp);
+    this.lastThrottle = inp.throttle; this.lastSteer = inp.steer;
     return inp;
   }
 
@@ -114,13 +124,22 @@ export class Bot {
       if (icpt) return icpt;
       return { kind: 'position', x: ball.pos.x, z: ball.pos.z - dir * 3, speed: 1 };
     }
+    const attackDepth = ball.pos.z * dir; // >0: ball in the opponent half
     if (role === 1) {
-      if (car.boost < 35 * this.cfg.boostUse + 5) { const bp = this.boostPlan(world, car, dir, false); if (bp) return bp; }
-      const z = clamp(ball.pos.z - dir * 20, -arena.halfL + 6, arena.halfL - 6);
-      return { kind: 'position', x: ball.pos.x * 0.45, z, speed: 0.85, face: true };
+      // second man: follow the play goal-side, closer when we are attacking, ready to take over
+      if (car.boost < 45 * this.cfg.boostUse + 5) { const bp = this.boostPlan(world, car, dir, false, 22); if (bp) return bp; }
+      const back = attackDepth > 18 ? 11 : attackDepth > 0 ? 14 : 18;
+      const side = ball.pos.x > 0 ? -1 : 1;
+      const x = clamp(ball.pos.x * 0.55 + side * 7, -arena.halfW + 6, arena.halfW - 6);
+      const z = clamp(ball.pos.z - dir * back, -arena.halfL + 6, arena.halfL - 6);
+      return { kind: 'position', x, z, speed: 0.95, face: true };
     }
-    // last back: goalkeeper, shading toward the ball side
-    return { kind: 'position', x: clamp(ball.pos.x * 0.25, -5, 5), z: ownGoalZ + dir * 3.5, speed: 0.9, face: true };
+    // last back: shadow in our half; drop to the back post only when the ball is in our half
+    if (car.boost < 30 * this.cfg.boostUse + 5) { const bp = this.boostPlan(world, car, dir, false, 18); if (bp) return bp; }
+    if (attackDepth > 5) {
+      return { kind: 'position', x: clamp(ball.pos.x * 0.3, -14, 14), z: clamp(-dir * 10 + ball.pos.z * 0.35, -arena.halfL + 8, arena.halfL - 8), speed: 0.85, face: true };
+    }
+    return { kind: 'position', x: clamp(-Math.sign(ball.pos.x || 1) * 4 + ball.pos.x * 0.15, -6, 6), z: ownGoalZ + dir * 5, speed: 0.95, face: true };
   }
 
   challengeCost(c, ball, dir, kickoff) {
@@ -174,7 +193,7 @@ export class Bot {
     return null;
   }
 
-  boostPlan(world, car, dir, kickoff) {
+  boostPlan(world, car, dir, kickoff, maxDist = 40) {
     const arena = world.arena, ball = world.ball;
     let best = null, bestScore = Infinity;
     arena.pads.forEach((p, i) => {
@@ -183,9 +202,9 @@ export class Bot {
       if (!kickoff && (ball.pos.z - p.z) * dir < -2) return;
       const d = Math.hypot(p.x - car.pos.x, p.z - car.pos.z);
       const score = d / (p.large ? 2.2 : 1);
-      if (score < bestScore && d < 40) { bestScore = score; best = p; }
+      if (score < bestScore && d < maxDist) { bestScore = score; best = p; }
     });
-    return best ? { kind: 'position', x: best.x, z: best.z, speed: 1, pad: true, boostOk: false } : null;
+    return best ? { kind: 'position', x: best.x, z: best.z, speed: 1, pad: true, padIndex: arena.pads.indexOf(best), boostOk: false } : null;
   }
 
   // ---------------- execution ----------------
@@ -201,16 +220,23 @@ export class Bot {
 
     if (plan.kind === 'position') {
       // arrive and stop, then face the ball
-      const desired = Math.min(23, dist * 1.4) * plan.speed;
-      if (dist < 2.5) {
-        inp.throttle = clamp(-speed * 0.3, -1, 1);
-        if (plan.face || dist < 1) {
-          const ba = this.angleTo(car, world.ball.pos);
-          if (Math.abs(ba) > 0.4) { inp.throttle = 0.6; inp.steer = clamp(ba * 3, -1, 1); }
-        }
+      const desired = Math.min(23, dist * 1.6 + 4) * plan.speed;
+      if (plan.pad) {
+        // drive straight through the pad at speed; three-point turn if it is behind us and we are slow
+        const reverse = Math.abs(ang) > 2.0 && speed < 5;
+        inp.throttle = reverse ? -1 : 1;
+        if (reverse) inp.steer = -inp.steer;
+        else if (Math.abs(ang) > 1.4) inp.slide = speed > 6;
+      } else if (dist < 4) {
+        // arrived: keep rolling and turn to face the ball (cars never sit still)
+        const ba = this.angleTo(car, world.ball.pos);
+        inp.steer = clamp(ba * 2.5, -1, 1);
+        inp.throttle = Math.abs(ba) > 0.5 ? 0.7 : speed < 4 ? 0.45 : 0.1;
       } else {
-        inp.throttle = Math.abs(ang) > 2.4 && dist < 8 ? -1 : clamp((desired - speed) * 0.5, -1, 1);
-        if (Math.abs(ang) > 2.4 && dist < 8) inp.steer = -inp.steer;
+        const reverse = Math.abs(ang) > 2.4 && dist < 8 && speed < 5;
+        inp.throttle = reverse ? -1 : clamp((desired - speed) * 0.5, -1, 1);
+        if (reverse) inp.steer = -inp.steer;
+        else if (Math.abs(ang) > 1.6) { inp.throttle = Math.max(inp.throttle, 0.8); inp.slide = speed > 5; }
       }
       inp.boost = plan.boostOk !== false && desired > 15 && Math.abs(ang) < 0.25 && speed < 21 && car.boost > 30 * (1 - this.cfg.boostUse) + 10;
       return;
@@ -264,7 +290,10 @@ export class Bot {
     this.actionT += dt;
     const t = this.actionT;
     inp.throttle = 1;
-    if (a.kind === 'jump') {
+    if (a.kind === 'unstick') {
+      inp.throttle = -1; inp.steer = clamp(a.steer * 2, -1, 1);
+      if (t > 0.7) { this.action = null; this.nextThink = 0; this.lastThrottle = 0; }
+    } else if (a.kind === 'jump') {
       inp.jump = t < (a.hold ? 0.2 : 0.05);
       if (t > 0.9 || (t > 0.3 && car.onGround)) this.action = null;
     } else if (a.kind === 'dodge') {

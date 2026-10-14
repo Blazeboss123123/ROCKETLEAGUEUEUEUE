@@ -80,12 +80,13 @@ export const CAR = {
 
   // Dodges
   dodgeDeadzone: 0.5,     // stick magnitude needed to dodge instead of double jump
-  dodgeImpulseForward: 5.0,
-  dodgeImpulseBackward: 5.33,
-  dodgeImpulseSide: 5.0,
+  dodgeImpulseForward: 5.6,   // instant speed gained by a front flip (m/s)
+  dodgeImpulseBackward: 5.9,
+  dodgeImpulseSide: 5.2,
   dodgeSideSpeedScale: 0.9,// extra side impulse proportional to speed (fraction of maxSpeed)
-  dodgeSpin: 5.5,          // flip angular speed (rad/s)
-  dodgeDuration: 0.65,     // s during which flip torque overrides air control
+  dodgeDuration: 0.6,      // a flip is exactly one full rotation over this time (s)
+  dodgeCancelAfter: 0.06,  // pulling the stick the opposite way after this cancels the flip rotation (s)
+  dodgeFriction: 0.05,     // surface friction while flipping, so scraping the floor keeps momentum
   dodgeVerticalCancel: true,
 
   // Boost
@@ -93,6 +94,12 @@ export const CAR = {
   boostUsePerSec: 33.3,    // boost units per second
   boostMax: 100,
   boostMinTime: 0.1,       // a tap of boost lasts at least this long (s)
+
+  // Supersonic and demolitions
+  supersonicSpeed: 21.95,  // m/s; at or above this speed the car is supersonic
+  supersonicKeep: 21.0,    // stays supersonic until it drops below this speed
+  demoAlign: 0.55,         // the attacker must be driving into the victim (cosine of the angle)
+  respawnTime: 3,          // s before a demolished car respawns
 
   // Recovery
   recoverTorque: 9,        // rad/s^2 used to right a car resting on its roof

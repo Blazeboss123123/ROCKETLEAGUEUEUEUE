@@ -4,6 +4,15 @@ An original rocket-car football game: drive, boost, jump, dodge and fly to put a
 
 Everything except the three.js renderer (MIT) was written for this project: simulation, networking, WebSocket server, bots, procedural cars/arenas, synthesised audio and UI. No third-party game assets.
 
+## Update 2: movement, demolitions, bots, cars
+
+- **Flips** now complete exactly one rotation and land wheels-down, add ~5.6 m/s, and keep you above the normal throttle top speed. Scraping the floor mid-flip no longer kills momentum. Pull the stick the opposite way to cancel a flip.
+- **Demolitions**: hit an opponent nose-first while supersonic (≥ 21.95 m/s, shown by a white wake) to destroy them; they respawn at their own end after 3 s. Counted in the scoreboard.
+- **Smoother motion**: fixed a render-interpolation hitch whenever a network snapshot arrived; body lean under acceleration, braking and cornering; a few degrees of extra field of view at speed (Settings → Camera).
+- **Camera** now ray-marches against the arena and can't end up behind walls, the ceiling or goal frames.
+- **Bots** follow the play instead of parking, back out when pinned against posts/walls, and drive through boost pads; idle time in 3v3 dropped from ~40 % to ~4 %.
+- **Cars** rebuilt as lofted bodies with fender arches, tyres with tread, rims with brake discs and calipers, lights, twin boost nozzles and per-body aero.
+
 ## Why a browser game and not Unreal/Unity
 
 The build environment had no Unreal Engine or Unity and no way to install them, so the game is built on the web platform: three.js for rendering and a dependency-free JavaScript simulation that runs identically on the server, on a browser host, and inside every client for prediction. The architecture (fixed-step authoritative simulation, input-only clients, prediction + reconciliation) is the same one you would build in UE5; the module boundaries below map one-to-one onto the brief's recommended modules.

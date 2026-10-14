@@ -214,13 +214,13 @@ export function resultsOverlay(app, result, progress) {
   let mvp = null, best = -1;
   for (const r of result.roster) if (r.team === result.winner && stats[r.pid] && stats[r.pid].score > best) { best = stats[r.pid].score; mvp = r.pid; }
   const table = h('table', { class: 'stats' },
-    h('tr', null, ['Player', 'Score', 'Goals', 'Assists', 'Saves', 'Shots'].map((x) => h('th', null, x))),
+    h('tr', null, ['Player', 'Score', 'Goals', 'Assists', 'Saves', 'Shots', 'Demos'].map((x) => h('th', null, x))),
     [0, 1].map((team) => [
-      h('tr', { class: 'team-head', style: { '--c': app.colors[team].css } }, h('td', { colspan: 6 }, `${app.colors[team].name} — ${result.score[team]}`)),
+      h('tr', { class: 'team-head', style: { '--c': app.colors[team].css } }, h('td', { colspan: 7 }, `${app.colors[team].name} — ${result.score[team]}`)),
       result.roster.filter((r) => r.team === team).sort((a, b) => (stats[b.pid]?.score || 0) - (stats[a.pid]?.score || 0)).map((r) => {
         const s = stats[r.pid] || {};
         return h('tr', { class: r.pid === S.pid ? 'me' : '' }, h('td', null, r.name, r.bot ? h('span', { class: 'muted small' }, ' (bot)') : null, r.pid === mvp ? h('span', { class: 'mvp' }, 'MVP') : null),
-          h('td', null, s.score || 0), h('td', null, s.goals || 0), h('td', null, s.assists || 0), h('td', null, s.saves || 0), h('td', null, s.shots || 0));
+          h('td', null, s.score || 0), h('td', null, s.goals || 0), h('td', null, s.assists || 0), h('td', null, s.saves || 0), h('td', null, s.shots || 0), h('td', null, s.demos || 0));
       }),
     ]));
   const L = S.lobby;

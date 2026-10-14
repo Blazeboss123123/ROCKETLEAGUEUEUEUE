@@ -86,6 +86,7 @@ export class AudioEngine {
       case 'ballWall': { const d = this.spatial(pos); const s = Math.min(1, (opts.strength || 4) / 25); this.tone('sine', 110, 55, 0.25, 0.2 + s * 0.35, d); this.burstNoise(600, 1.2, 0.15, 0.1 + s * 0.2, d); break; }
       case 'carWall': case 'bump': { const d = this.spatial(pos); const s = Math.min(1, (opts.strength || 4) / 15); this.burstNoise(300, 0.8, 0.2, 0.15 + s * 0.35, d, 'lowpass'); this.tone('sawtooth', 70, 40, 0.15, 0.08 + s * 0.12, d); break; }
       case 'pickup': { const d = this.spatial(pos); if (opts.large) { this.tone('triangle', 520, 1040, 0.25, 0.25, d); this.tone('sine', 780, 1560, 0.3, 0.15, d, 0.05); } else this.tone('triangle', 900, 1300, 0.08, 0.16, d); break; }
+      case 'demo': { const d = this.spatial(pos); this.tone('sine', 90, 30, 0.7, 0.9, d); this.burstNoise(700, 0.5, 0.9, 0.8, d, 'lowpass', 0, 120); this.burstNoise(3000, 0.8, 0.3, 0.35, d, 'bandpass'); break; }
       case 'boostEmpty': this.tone('square', 220, 180, 0.06, 0.06, this.sfx); break;
       case 'countdown': this.tone('square', 660, 660, 0.12, 0.18, this.ui); break;
       case 'go': this.tone('square', 1320, 1320, 0.35, 0.2, this.ui); this.tone('sine', 660, 660, 0.35, 0.15, this.ui); break;

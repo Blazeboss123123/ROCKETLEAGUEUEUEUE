@@ -33,6 +33,7 @@ export function settingsScreen(app, params = {}) {
     ],
     camera: () => [
       row('Field of view', 'Horizontal degrees', slider('fov', 70, 120, 1, (v) => v + '°')),
+      row('Speed FOV boost', 'Extra field of view at high speed (0 = off)', slider('speedFov', 0, 12, 1, (v) => '+' + v + '°')),
       row('Distance', 'Metres behind the car', slider('distance', 2, 4.5, 0.05, (v) => v.toFixed(2))),
       row('Height', null, slider('height', 0.5, 2, 0.05, (v) => v.toFixed(2))),
       row('Stiffness', 'How tightly the camera follows', slider('stiffness', 0, 1, 0.05, (v) => v.toFixed(2))),

@@ -453,7 +453,7 @@ class App {
       src.carRender(c, _p, _q);
       v.id = c.id; v.team = c.team; v.pos.set(_p.x, _p.y, _p.z); v.quat.set(_q.x, _q.y, _q.z, _q.w);
       v.vel.set(c.vel.x, c.vel.y, c.vel.z); v.boosting = c.boosting; v.fwdSpeed = c.vel.dot(c.fwd); v.steer = c.input?.steer || 0; v.onGround = c.onGround; v.boost = c.boost; v.throttle = c.input?.throttle || 0;
-      v.hidden = false;
+      v.hidden = c.demoT > 0; v.supersonic = c.supersonic;
       cars.push(v);
     }
     src.ballRender(_p);
@@ -473,7 +473,9 @@ class App {
     } else {
       const mine = view.cars.find((c) => c.id === myPid);
       const state = W.match.state;
-      if (mine && state !== 'ended') {
+      if (mine && mine.hidden && state !== 'ended') {
+        R.rig.cinematic(dt, view.ball.hidden ? mine.pos : view.ball.pos, s, mine.pos.x > 0 ? 1 : -1);
+      } else if (mine && state !== 'ended') {
         R.rig.update(dt, mine.pos, mine.quat, mine.vel, mine.onGround, view.ball.hidden ? null : view.ball.pos, s, ui.ballCam, ui.lookBack);
       } else {
         R.rig.orbit(dt, view.ball.hidden ? new THREE.Vector3(0, 1, 0) : view.ball.pos, 26, 12, s);
@@ -487,6 +489,7 @@ class App {
       const camPos = R.camera.position;
       const sorted = view.cars.map((c) => ({ c, d: c.id === myPid ? -1 : c.pos.distanceTo(camPos) })).sort((a, b) => a.d - b.d).slice(0, 4);
       for (const { c } of sorted) {
+        if (c.hidden) continue;
         const info = this.engineProfileFor(c.id);
         this.audio.engine(c.id, info, c.pos, Math.abs(c.fwdSpeed || 0), c.throttle || 0, c.boosting, c.id === myPid);
       }
@@ -538,6 +541,7 @@ class App {
         case 'bump': A.play('bump', { pos: carPos(e.a), strength: e.speed }); if (e.a === myPid || e.b === myPid) R.rig?.addShake(Math.min(1, e.speed / 12), this.settings); break;
         case 'pickup': { const pad = (this.session?.world || this.training?.world).arena.pads[e.pad]; R.pickup(pad, e.large); if (e.car === myPid) A.play('pickup', { large: e.large }); break; }
         case 'boostOff': if (e.car === myPid && e.empty) A.play('boostEmpty'); break;
+        case 'respawn': { const c = this.view?.cars.find((x) => x.id === e.car); const car = (this.session?.world || this.training?.world)?.car(e.car); if (car) R.respawnFx(car.pos, car.team); void c; break; }
         default: break;
       }
     }
@@ -558,6 +562,14 @@ class App {
         break;
       }
       case 'end': this.replay.playing = null; this.onMatchEnd(e.result); break;
+      case 'demo': {
+        const vic = S.playerInfo(e.victim), att = S.playerInfo(e.attacker);
+        this.renderer.demolition(e, vic ? vic.team : 0);
+        this.audio.play('demo', { pos: e });
+        if (e.victim === S.pid || e.attacker === S.pid) this.renderer.rig?.addShake(0.8, this.settings);
+        this.hud.feedMsg(`${att?.name || '?'} demolished ${vic?.name || '?'}`, att ? this.colors[att.team]?.css : null);
+        break;
+      }
       case 'chat': if (!this.settings.quickChatOff) { const info = S.playerInfo(e.pid); this.hud.feedMsg(`${info?.name || '?'}: ${e.text}`, info ? this.colors[info.team]?.css : null); this.audio.play('chat'); } break;
       case 'state':
         if (e.to === 'countdown') this.replay.playing = null;
@@ -610,7 +622,7 @@ class App {
     const m = W.match;
     return {
       kind: S.kind, score: m.score, clock: m.clock, overtime: m.overtime, waitingGround: m.waitingGround, state: m.state, timer: m.timer,
-      boost: me ? me.boost : 0, hasCar: !!me, roster: this.rosterWithConn(S), rtt: S.rtt, showPing: this.settings.showPing, code: S.code, priv: S.priv,
+      boost: me ? me.boost : 0, hasCar: !!me && !(me.demoT > 0), demoT: me ? me.demoT : 0, roster: this.rosterWithConn(S), rtt: S.rtt, showPing: this.settings.showPing, code: S.code, priv: S.priv,
       goSince: this.goSince, kickoffText: m.overtime ? 'Overtime' : 'Kickoff', replay: !!this.replay.playing, replayHint: 'press Jump to skip',
       midText: m.state === 'ended' ? 'Full time' : m.waitingGround && m.state === 'live' ? 'Time is up — the match ends when the ball touches the ground' : '', quickChatOpen: this.quickChat, conn: S.closed ? 'lost' : 'ok',
     };

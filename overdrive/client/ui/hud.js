@@ -69,7 +69,8 @@ export class HUD {
     this.boost.classList.toggle('hidden', !st.hasCar);
     // centre: countdown / overtime / waiting
     let msg = '', sub = '';
-    if (st.state === 'countdown' && st.timer > 0) { msg = String(Math.ceil(st.timer)); sub = st.overtime ? 'Overtime — next goal wins' : st.kickoffText || 'Kickoff'; }
+    if (st.demoT > 0) { msg = 'DEMOLISHED'; sub = `Respawning in ${Math.ceil(st.demoT)}`; }
+    else if (st.state === 'countdown' && st.timer > 0) { msg = String(Math.ceil(st.timer)); sub = st.overtime ? 'Overtime — next goal wins' : st.kickoffText || 'Kickoff'; }
     else if (st.goSince < 0.7) msg = 'GO!';
     else if (st.state === 'waiting') sub = 'Waiting for the match to start…';
     this.set(this.center, 'center', msg + '|' + sub, () => {
@@ -121,12 +122,12 @@ export class HUD {
     this.board.appendChild(h('div', { class: 'panel modal', style: { minWidth: 'min(760px, 94vw)' } },
       h('h2', null, 'Scoreboard'),
       h('table', { class: 'stats' },
-        h('tr', null, ['Player', 'Score', 'Goals', 'Assists', 'Saves', 'Shots', 'Ping'].map((x) => h('th', null, x))),
+        h('tr', null, ['Player', 'Score', 'Goals', 'Assists', 'Saves', 'Shots', 'Demos', 'Ping'].map((x) => h('th', null, x))),
         [0, 1].map((team) => [
-          h('tr', { class: 'team-head', style: { '--c': app.colors[team].css } }, h('td', { colspan: 7 }, `${app.colors[team].name} — ${data.score[team]}`)),
+          h('tr', { class: 'team-head', style: { '--c': app.colors[team].css } }, h('td', { colspan: 8 }, `${app.colors[team].name} — ${data.score[team]}`)),
           data.roster.filter((r) => r.team === team).map((r) => { const s = stats[r.pid] || {}; return h('tr', { class: r.pid === data.me ? 'me' : '' },
             h('td', null, r.name, r.bot ? h('span', { class: 'muted small' }, ' (bot)') : r.conn === 3 ? h('span', { class: 'muted small' }, ' (disconnected — bot driving)') : r.conn === 0 ? h('span', { class: 'muted small' }, ' (disconnected)') : null),
-            h('td', null, s.score || 0), h('td', null, s.goals || 0), h('td', null, s.assists || 0), h('td', null, s.saves || 0), h('td', null, s.shots || 0),
+            h('td', null, s.score || 0), h('td', null, s.goals || 0), h('td', null, s.assists || 0), h('td', null, s.saves || 0), h('td', null, s.shots || 0), h('td', null, s.demos || 0),
             h('td', null, r.bot ? 'BOT' : data.ping?.[r.pid] ? data.ping[r.pid] + ' ms' : '—')); }),
         ]))));
   }

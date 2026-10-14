@@ -7,7 +7,7 @@ export const DEFAULT_SETTINGS = {
   // display
   quality: 'high', renderScale: 1, fpsLimit: 0, vsync: true, displayMode: 'windowed', showFps: false,
   // camera
-  fov: 100, distance: 2.9, height: 1.05, stiffness: 0.45, swivelSpeed: 4.5, transitionSpeed: 1.2, cameraShake: false, ballCamDefault: true,
+  fov: 108, distance: 3.0, height: 1.05, speedFov: 6, stiffness: 0.45, swivelSpeed: 4.5, transitionSpeed: 1.2, cameraShake: false, ballCamDefault: true,
   // controls
   mouseSensitivity: 1, steerSensitivity: 1, aerialSensitivity: 1, deadzone: 0.12, invertPitch: false,
   // audio

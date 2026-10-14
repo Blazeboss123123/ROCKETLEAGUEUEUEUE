@@ -6,7 +6,7 @@ import { Particles, Rings, goalExplosion } from './effects.js';
 import { CameraRig } from '../camera.js';
 import { BALL } from '../../shared/config.js';
 
-const _p = new THREE.Vector3(), _q = new THREE.Quaternion(), _v = new THREE.Vector3();
+const _p = new THREE.Vector3(), _q = new THREE.Quaternion(), _v = new THREE.Vector3(), _a = new THREE.Vector3(), _q2 = new THREE.Quaternion();
 
 function ballTexture() {
   const c = document.createElement('canvas'); c.width = 512; c.height = 256;
@@ -283,21 +283,43 @@ export class GameRenderer {
       rc.obj.position.copy(c.pos);
       rc.obj.quaternion.copy(c.quat);
       rc.obj.visible = !c.hidden;
+      if (c.hidden) { if (rc.plate) rc.plate.visible = false; rc.prevVel = null; continue; }
+      const ud = rc.obj.userData;
       // wheels spin with forward speed, front wheels steer
       const fwdSpeed = c.fwdSpeed || 0;
-      rc.spin += fwdSpeed * dt / 0.17;
-      for (const w of rc.obj.userData.wheels) {
+      rc.spin += fwdSpeed * dt / (ud.wheels[0]?.userData.r || 0.19);
+      for (const w of ud.wheels) {
         w.userData.spin.rotation.x = rc.spin;
-        if (w.userData.front) w.rotation.y = -(c.steer || 0) * 0.45;
+        if (w.userData.front) w.rotation.y = -(c.steer || 0) * 0.42;
       }
-      const flame = rc.obj.userData.flame;
-      flame.visible = !!c.boosting;
-      if (c.boosting) {
-        flame.scale.set(1, 0.8 + Math.random() * 0.5, 1);
-        rc.obj.userData.flameMat.color.set(rc.trail === 'ember' ? 0xffa040 : rc.trail === 'vapour' ? 0xe5e7eb : rc.trail === 'prism' ? 0xf0abfc : rc.trail === 'aurora' ? 0x6ee7b7 : 0x93c5fd);
-        _v.set(0, -0.04, -0.72).applyQuaternion(c.quat).add(c.pos);
+      // body lean: squat under acceleration, dive under braking, roll out of corners (visual only)
+      if (c.vel && dt > 0) {
+        if (!rc.prevVel) rc.prevVel = c.vel.clone();
+        _a.subVectors(c.vel, rc.prevVel).divideScalar(dt);
+        rc.prevVel.copy(c.vel);
+        _q2.copy(c.quat).invert();
+        _a.applyQuaternion(_q2); // local acceleration: x = left, z = forward
+        const tp = c.onGround ? Math.max(-0.07, Math.min(0.07, -_a.z * 0.004)) : 0;
+        const tr = c.onGround ? Math.max(-0.09, Math.min(0.09, _a.x * 0.0045)) : 0;
+        rc.pitch = (rc.pitch || 0) + (tp - (rc.pitch || 0)) * Math.min(1, dt * 7);
+        rc.roll = (rc.roll || 0) + (tr - (rc.roll || 0)) * Math.min(1, dt * 7);
+        ud.body.rotation.set(rc.pitch, 0, rc.roll);
+      }
+      const boosting = !!c.boosting;
+      const flameCol = rc.trail === 'ember' ? 0xffa040 : rc.trail === 'vapour' ? 0xe5e7eb : rc.trail === 'prism' ? 0xf0abfc : rc.trail === 'aurora' ? 0x6ee7b7 : rc.trail === 'arc' ? 0xe0f2fe : 0x93c5fd;
+      for (const fl of ud.flames) { fl.visible = boosting; if (boosting) fl.scale.set(1, 0.75 + Math.random() * 0.55, 1); }
+      ud.coreMat.color.set(boosting ? flameCol : 0x1c2430);
+      if (boosting) {
+        ud.flameMat.color.set(flameCol);
+        _v.set(0, -0.1, (ud.nozzleZ || -0.7) - 0.05).applyQuaternion(c.quat).add(c.pos);
         const back = _p.set(0, 0, 1).applyQuaternion(c.quat);
         this.fx.trail(rc.trail, _v.x, _v.y, _v.z, back.x, back.y, back.z, c.vel?.x || 0, c.vel?.y || 0, c.vel?.z || 0, dt, this.time);
+      }
+      if (c.supersonic) {
+        // supersonic: thin white wake streaming off the car
+        _v.set((Math.random() - 0.5) * 0.8, 0.05 + Math.random() * 0.25, (ud.nozzleZ || -0.7)).applyQuaternion(c.quat).add(c.pos);
+        const back = _p.set(0, 0, 1).applyQuaternion(c.quat);
+        this.fx.trail('supersonic', _v.x, _v.y, _v.z, back.x, back.y, back.z, 0, 0, 0, dt, this.time);
       }
       if (rc.obj.userData.halo) rc.obj.userData.halo.rotation.z += dt;
       if (rc.plate) rc.plate.visible = !!s.nameplates && !c.hidden;
@@ -338,6 +360,19 @@ export class GameRenderer {
   }
   pickup(pos, large) {
     this.fx.burst(pos.x, pos.y + 0.4, pos.z, large ? 40 : 12, large ? 7 : 4, 0.5, 0.18, [0xffd27a, 0xffb020], { up: 2, endSize: 0.03 });
+  }
+  demolition(pos, team) {
+    const col = this.colors[team] || this.colors[0];
+    const P = new THREE.Vector3(pos.x, pos.y, pos.z);
+    this.fx.burst(P.x, P.y, P.z, 160, 14, 0.9, 0.55, [0xfff1c1, 0xffb347, 0xff5a1f, col.light], { endSize: 0.1 });
+    this.fx.burst(P.x, P.y, P.z, 50, 4, 1.8, 1.4, [0x3a3f4b, 0x6b7280], { alpha: 0.5, endSize: 2.4, up: 1.5 });
+    this.fx.burst(P.x, P.y, P.z, 40, 9, 1.2, 0.14, [0x9ca3af, 0xe5e7eb], { gravity: -9, up: 4, shape: 1, endSize: 0.08 });
+    this.rings.add(P, new THREE.Vector3(0, 1, 0), 0xffb347, 7, 0.5);
+    this.flash.color.set(0xff8a3d); this.flash.position.copy(P); this.flash.intensity = 300;
+  }
+  respawnFx(pos, team) {
+    const col = this.colors[team] || this.colors[0];
+    this.fx.burst(pos.x, pos.y + 0.3, pos.z, 40, 3, 0.6, 0.2, [col.main, col.light, 0xffffff], { up: 2, endSize: 0.02 });
   }
   dust(pos) {
     this.fx.burst(pos.x, 0.15, pos.z, 10, 2.5, 0.6, 0.35, [0x9ca3af], { flat: true, alpha: 0.4, endSize: 0.6 });

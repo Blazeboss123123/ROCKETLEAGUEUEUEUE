@@ -24,6 +24,7 @@ export class CameraRig {
   // carPos/carQuat: render state of the followed car; ball: ball position or null
   update(dt, carPos, carQuat, carVel, onGround, ball, settings, ballCam, lookBack) {
     const s = settings;
+    this.speed = carVel ? carVel.length() : 0;
     const k = 1 - Math.exp(-dt * s.transitionSpeed * 4);
     this.ballCamT += ((ballCam && ball ? 1 : 0) - this.ballCamT) * k;
     this.backT += ((lookBack ? 1 : 0) - this.backT) * (1 - Math.exp(-dt * 14));
@@ -80,13 +81,26 @@ export class CameraRig {
     this.apply(dt, s);
   }
 
+  // Keep the camera inside the arena: march from the car towards the desired camera spot and stop
+  // short of the first surface (walls, ceiling, goal frames), so it never ends up outside the glass.
   collide(carPos) {
-    // keep the camera inside the playable volume, sliding towards the car if needed
-    const a = this.arena;
-    for (let i = 0; i < 10; i++) {
-      const d = a.interior(this.pos.x, this.pos.y, this.pos.z);
-      if (d > 0.35) break;
-      this.pos.lerp(carPos, 0.2);
+    const a = this.arena, margin = 0.45;
+    const px = carPos.x + this.up.x * 0.45, py = carPos.y + this.up.y * 0.45, pz = carPos.z + this.up.z * 0.45;
+    const dx = this.pos.x - px, dy = this.pos.y - py, dz = this.pos.z - pz;
+    const len = Math.hypot(dx, dy, dz);
+    if (len < 1e-4) return;
+    const ux = dx / len, uy = dy / len, uz = dz / len;
+    let t = 0, safe = 0;
+    if (a.interior(px, py, pz) < margin) { this.pos.set(px, py, pz); return; }
+    while (t < len) {
+      const d = a.interior(px + ux * t, py + uy * t, pz + uz * t);
+      if (d < margin) break;
+      safe = t;
+      t += Math.max(0.05, d - margin);
+    }
+    if (t < len) {
+      const k = Math.max(0, safe);
+      this.pos.set(px + ux * k, py + uy * k, pz + uz * k);
     }
   }
 
@@ -101,12 +115,17 @@ export class CameraRig {
     this.cam.lookAt(this.look);
     // horizontal FOV setting -> vertical FOV for three.js
     const aspect = this.cam.aspect || 16 / 9;
-    const vfov = 2 * Math.atan(Math.tan((s.fov * Math.PI / 180) / 2) / aspect) * 180 / Math.PI;
+    // a few degrees of extra field of view at high speed sells the acceleration
+    const want = Math.min(1, Math.max(0, ((this.speed || 0) - 13) / 10)) * (s.speedFov ?? 6);
+    this.fovKick = (this.fovKick || 0) + (want - (this.fovKick || 0)) * Math.min(1, dt * 4);
+    const hfov = Math.min(130, s.fov + this.fovKick);
+    const vfov = 2 * Math.atan(Math.tan((hfov * Math.PI / 180) / 2) / aspect) * 180 / Math.PI;
     if (Math.abs(this.cam.fov - vfov) > 0.01) { this.cam.fov = vfov; this.cam.updateProjectionMatrix(); }
   }
 
   // cinematic camera for replays/celebrations: follows a point from a broadcast angle
   cinematic(dt, focus, settings, side = 1) {
+    this.speed = 0;
     const want = _t.set(focus.x * 0.6 + side * 14, Math.max(4, focus.y + 4), focus.z - Math.sign(focus.z || 1) * 14);
     this.pos.lerp(want, 1 - Math.exp(-dt * 3));
     this.collide(focus);
@@ -116,6 +135,7 @@ export class CameraRig {
   }
 
   orbit(dt, center, radius, height, settings) {
+    this.speed = 0;
     this.orbitA += dt * 0.12;
     const want = _t.set(center.x + Math.cos(this.orbitA) * radius, height, center.z + Math.sin(this.orbitA) * radius);
     this.pos.lerp(want, 1 - Math.exp(-dt * 2));

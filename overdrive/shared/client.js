@@ -77,7 +77,7 @@ export class ClientSession {
     this.world = new World({ seed: m.seed, duration: m.duration, authoritative: false, arenaParams: ARENA_VARIANTS[this.arenaId].params });
     for (const r of m.roster) this.world.addCar(r.pid, r.team);
     this.world.startMatch();
-    this.pending = []; this.lastSnapTick = -1; this.acc = 0; this.lastGoalSeq = 0; this.firstSnap = true;
+    this.pending = []; this.lastSnapTick = -1; this.acc = 0; this.lastGoalSeq = 0; this.firstSnap = true; this.firstDemo = true;
     this.smooth.clear(); this.ballOff.set(0, 0, 0);
     this.events.push({ type: 'start', mid: m.mid });
   }
@@ -96,6 +96,7 @@ export class ClientSession {
         const prevState = w.match.state;
 
     w.applySnapshot(snap);
+    const authDemoSeq = w.demoSeq || 0, authDemo = w.lastDemo;
     const ack = m.a && Number.isInteger(m.a[this.pid]) ? m.a[this.pid] : -1;
     if (ack >= 0) while (this.pending.length && this.pending[0].seq <= ack) this.pending.shift();
     // re-simulate inputs the authority has not processed yet
@@ -134,7 +135,21 @@ export class ClientSession {
     const bdx = ballBefore.x - w.ball.pos.x, bdy = ballBefore.y - w.ball.pos.y, bdz = ballBefore.z - w.ball.pos.z;
     if (Math.hypot(bdx, bdy, bdz) < 6 && !w.ballHidden) { this.ballOff.x += bdx; this.ballOff.y += bdy; this.ballOff.z += bdz; this.ballOff.clampLen(4); }
     else this.ballOff.set(0, 0, 0);
-    this.capturePrev();
+    // keep render interpolation continuous: shift the previous-tick sample by the same correction
+    for (const c of w.cars) {
+      const b = before.get(c.id), p = this.prev.get(c.id);
+      if (b && p) { p.p.x += c.pos.x - b.p.x; p.p.y += c.pos.y - b.p.y; p.p.z += c.pos.z - b.p.z; }
+      else if (!p) this.capturePrev();
+    }
+    const pb = this.prev.get('ball');
+    if (pb) { pb.p.x += w.ball.pos.x - ballBefore.x; pb.p.y += w.ball.pos.y - ballBefore.y; pb.p.z += w.ball.pos.z - ballBefore.z; }
+    // demolitions are announced from authoritative state only
+    if (this.firstDemo) { this.firstDemo = false; this.authDemoSeq = authDemoSeq; }
+    else if (authDemoSeq > (this.authDemoSeq || 0) && authDemo) {
+      this.authDemoSeq = authDemoSeq;
+      const v = before.get(authDemo.victim);
+      this.events.push({ type: 'demo', victim: authDemo.victim, attacker: authDemo.attacker, x: v ? v.p.x : 0, y: v ? v.p.y : 1, z: v ? v.p.z : 0 });
+    }
   }
 
   capturePrev() {

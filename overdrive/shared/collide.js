@@ -52,7 +52,7 @@ export function collideCarArena(car, arena) {
     _v.reject(_n);
     const vt = _v.len();
     if (vt > 1e-4) {
-      const jt = Math.min(vt / k, CAR.wallFriction * jn);
+      const jt = Math.min(vt / k, (car.dodgeTime > 0 ? CAR.dodgeFriction : CAR.wallFriction) * jn);
       _t.copy(_v).scale(-jt / vt);
       applyImpulse(car, _r, _t);
     }
@@ -127,7 +127,7 @@ export function collideCarBall(car, ball, tick, dt) {
 
 const _pa = new V3(), _pb = new V3();
 // Simple car-car bumps using two proxy spheres per car. Returns impact speed or 0.
-export function collideCars(a, b) {
+export function collideCars(a, b, demos) {
   if (a.frozen || b.frozen) return 0;
   const R = CAR.bumpRadius;
   let best = null, bestD = 2 * R;
@@ -144,6 +144,17 @@ export function collideCars(a, b) {
   _pb.copy(b.pos).addScaled(b.fwd, best[1]);
   _n.subVectors(_pb, _pa);
   if (bestD < 1e-5) _n.set(0, 1, 0); else _n.scale(1 / bestD);
+  // demolition: a supersonic car driving nose-first into an opponent destroys it
+  if (demos && a.team !== b.team) {
+    for (const [x, y, s] of [[a, b, 1], [b, a, -1]]) {
+      if (!x.supersonic) continue;
+      const sp = x.vel.len();
+      const into = (x.vel.dot(_n) * s) / sp;               // how directly x is driving at y
+      _v.subVectors(y.pos, x.pos).norm();
+      if (into > CAR.demoAlign && x.fwd.dot(_v) > 0.35) demos.push({ victim: y, attacker: x });
+    }
+    if (demos.length) return 2 * R - bestD;
+  }
   const pen = 2 * R - bestD;
   a.pos.addScaled(_n, -pen / 2); b.pos.addScaled(_n, pen / 2);
   _v.subVectors(b.vel, a.vel);

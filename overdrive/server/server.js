@@ -214,7 +214,9 @@ export function startServer(opts = {}) {
       pingT = now;
       for (const rec of sessions.values()) for (const c of rec.conns.values()) { c.pingAt = performance.now(); c.ws.ping(); }
     }
-    setTimeout(loop, 2);
+    // sleep until the next tick is due (keeps CPU low on small instances)
+    const wait = Math.max(0, (PHYSICS.dt - acc) * 1000 - 1);
+    setTimeout(loop, sessions.size ? Math.min(wait, 8) : 20);
   }
   loop();
 

@@ -47,6 +47,10 @@ export class Car {
     this.jumpClock = 0;        // seconds since first jump started
     this.doubleJumped = false; // second jump or dodge consumed
     this.dodgeTime = 0;        // remaining flip time
+    this.dodgeF = 0;           // flip axis weights (forward/back, side) for the current flip
+    this.dodgeS = 0;
+    this.supersonic = false;
+    this.demoT = 0;            // > 0 while demolished (seconds until respawn)
     this.boostTime = 0;        // seconds boost has been active (min boost duration)
     this.boosting = false;
     this.prevButtons = 0;
@@ -84,7 +88,8 @@ export class Car {
     this.rot.setAxisAngle(_t1.set(0, 1, 0), yaw);
     this.vel.set(0, 0, 0); this.angVel.set(0, 0, 0);
     this.onGround = true; this.groundNormal.set(0, 1, 0);
-    this.jumped = false; this.jumping = false; this.doubleJumped = false; this.dodgeTime = 0;
+    this.jumped = false; this.jumping = false; this.doubleJumped = false; this.dodgeTime = 0; this.dodgeF = 0; this.dodgeS = 0;
+    this.supersonic = false; this.demoT = 0;
     this.jumpClock = 0; this.boosting = false; this.boostTime = 0; this.jumpBuffer = 0; this.airTime = 0;
     this.updateAxes();
   }
@@ -235,9 +240,11 @@ export function stepCarControls(car, inp, arena, dt, events) {
         const sImp = sd * CAR.dodgeImpulseSide * (1 + CAR.dodgeSideSpeedScale * speedFrac);
         if (CAR.dodgeVerticalCancel && upright) vel.y = vel.y < 0 ? 0 : vel.y * 0.65;
         vel.addScaled(df, fImp).addScaled(dr, sImp);
-        // flip spin: forward input -> nose down (about -right = +left); right input -> roll right (about +fwd)
-        angVel.copy(left).scale(f * CAR.dodgeSpin).addScaled(fwd, sd * CAR.dodgeSpin);
-        car.dodgeTime = CAR.dodgeDuration;
+        // flip spin: forward input -> nose down (about +left); right input -> roll right (about +fwd).
+        // The flip always completes exactly one rotation so the car comes back wheels-down.
+        car.dodgeF = f; car.dodgeS = sd;
+        car.dodgeTime = flipTicks(dt) * dt;
+        flipSpin(car, dt);
         if (events) events.push({ type: 'dodge', car: car.id, f, s: sd });
       } else {
         vel.addScaled(up, CAR.doubleJumpImpulse);
@@ -258,10 +265,17 @@ export function stepCarControls(car, inp, arena, dt, events) {
     // ---------- air control ----------
     let pitch = inp.pitch, yaw = inp.yaw, roll = inp.roll;
     if (inp.slide) { roll = clamp(roll + yaw, -1, 1); yaw = 0; } // air-roll modifier
-    if (car.dodgeTime > 0) {
-      car.dodgeTime -= dt;
-      // during the flip, only yaw/roll trims are allowed; pitch is owned by the flip
-      angVel.addScaled(up, -yaw * CAR.airYawAccel * 0.25 * dt);
+    if (car.dodgeTime > dt * 0.5) {
+      const elapsed = flipTicks(dt) * dt - car.dodgeTime;
+      // flip cancel: pull the stick against the flip direction to stop the rotation
+      if (elapsed >= CAR.dodgeCancelAfter && Math.abs(car.dodgeF) > 0.3 && pitch * car.dodgeF < -0.5) {
+        car.dodgeTime = 0;
+        angVel.addScaled(left, -angVel.dot(left));
+      } else {
+        flipSpin(car, dt);
+        car.dodgeTime -= dt;
+        if (car.dodgeTime <= dt * 0.5) { car.dodgeTime = 0; angVel.set(0, 0, 0); }
+      }
     } else {
       // pitch input +1 (W) = nose down. Nose down is rotation about +left.
       angVel.addScaled(left, pitch * CAR.airPitchAccel * dt);
@@ -279,6 +293,17 @@ export function stepCarControls(car, inp, arena, dt, events) {
 
   vel.y -= g * dt;
   vel.clampLen(CAR.maxSpeed);
+  const sp = vel.len();
+  car.supersonic = sp >= CAR.supersonicSpeed || (car.supersonic && sp >= CAR.supersonicKeep);
+}
+
+// Number of fixed steps in one flip, and the matching angular speed for exactly 2*pi.
+function flipTicks(dt) { return Math.max(1, Math.round(CAR.dodgeDuration / dt)); }
+function flipSpin(car, dt) {
+  const w = (2 * Math.PI) / (flipTicks(dt) * dt);
+  const f = car.dodgeF, s = car.dodgeS, l = Math.hypot(f, s) || 1;
+  // the axis (left*f + fwd*s) is invariant under rotation about itself, so recomputing it each tick is exact
+  car.angVel.copy(car.left).scale((f / l) * w).addScaled(car.fwd, (s / l) * w);
 }
 
 export function integrateCar(car, dt) {

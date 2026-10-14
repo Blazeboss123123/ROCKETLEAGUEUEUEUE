@@ -3,6 +3,7 @@
 // client-side prediction. One call to step() advances exactly one fixed tick.
 
 import { PHYSICS, MATCH, BALL, CAR } from './config.js';
+const _demoHits = [];
 import { V3, Quat, rng, round } from './math.js';
 import { Arena } from './arena.js';
 import { Car, stepCarControls, integrateCar, neutralInput, BTN_JUMP, BTN_BOOST, BTN_SLIDE } from './car.js';
@@ -14,7 +15,7 @@ export const STATES = ['waiting', 'countdown', 'live', 'goal', 'ended', 'free'];
 const SC = Object.fromEntries(STATES.map((s, i) => [s, i]));
 
 export function newStats() {
-  return { score: 0, goals: 0, assists: 0, saves: 0, shots: 0, touches: 0, boost: 0 };
+  return { score: 0, goals: 0, assists: 0, saves: 0, shots: 0, touches: 0, boost: 0, demos: 0 };
 }
 
 export class World {
@@ -39,6 +40,7 @@ export class World {
       score: [0, 0], kickoffs: 0, goalSeq: 0, lastGoal: null, waitingGround: false,
     };
     this.ballHidden = false;
+    this.demoSeq = 0; this.lastDemo = null;
     this.lastTouch = null;   // {id, team, tick}
     this.touchHistory = [];  // recent touches for assists
     this.heading = -1;       // which goal the ball is currently threatening (authoritative only)
@@ -136,6 +138,11 @@ export class World {
     // ---- cars: controls + integration ----
     for (const car of this.cars) {
       if (frozenWorld) { car.frozen = true; }
+      if (car.demoT > 0) {
+        car.demoT -= dt;
+        if (car.demoT <= 0) this.respawn(car);
+        continue;
+      }
       const inp = this.inputs.get(car.id) || neutralInput();
       stepCarControls(car, inp, this.arena, dt, this.emitEvents ? this.events : null);
       if (this.unlimitedBoost) car.boost = 100;
@@ -150,13 +157,18 @@ export class World {
     }
     // ---- collisions ----
     for (const car of this.cars) {
+      if (car.demoT > 0) continue;
       const imp = collideCarArena(car, this.arena);
       if (imp > 4) this.event({ type: 'carWall', car: car.id, speed: imp });
     }
     for (let i = 0; i < this.cars.length; i++) {
       for (let j = i + 1; j < this.cars.length; j++) {
-        const imp = collideCars(this.cars[i], this.cars[j]);
-        if (imp > 2) this.event({ type: 'bump', a: this.cars[i].id, b: this.cars[j].id, speed: imp });
+        const a = this.cars[i], b = this.cars[j];
+        if (a.demoT > 0 || b.demoT > 0) continue;
+        _demoHits.length = 0;
+        const imp = collideCars(a, b, _demoHits);
+        for (const hit of _demoHits) this.demolish(hit.victim, hit.attacker);
+        if (!_demoHits.length && imp > 2) this.event({ type: 'bump', a: a.id, b: b.id, speed: imp });
       }
     }
     if (ballActive) {
@@ -166,6 +178,7 @@ export class World {
       const n = this.cars.length, rev = this.tick & 1;
       for (let k = 0; k < n; k++) {
         const car = this.cars[rev ? n - 1 - k : k];
+        if (car.demoT > 0) continue;
         const before = ball.vel.len();
         if (collideCarBall(car, ball, this.tick, dt)) this.onTouch(car, Math.abs(ball.vel.len() - before));
       }
@@ -180,7 +193,9 @@ export class World {
       if (this.pendingEval && this.tick > this.pendingEval.tick) this.evaluateTouch();
       if (m.state === 'live' && m.waitingGround && !m.overtime) {
         // regulation ends when the ball next touches the floor after 0:00
-        if (ball.pos.y < ball.radius + 0.3 || ball.onSurface) {
+        m.waitT = (m.waitT || 0) + dt;
+        if (ball.pos.y < ball.radius + 0.3 || ball.onSurface || m.waitT > 6) {
+          m.waitT = 0;
           if (m.score[0] !== m.score[1]) this.endMatch();
           else { m.overtime = true; m.clock = 0; m.waitingGround = false; this.event({ type: 'overtime' }); this.kickoff(); }
         }
@@ -193,6 +208,27 @@ export class World {
     }
   }
 
+  // Supersonic hit on an opponent: the victim explodes and respawns at its own end.
+  demolish(victim, attacker) {
+    if (victim.demoT > 0) return;
+    victim.demoT = CAR.respawnTime;
+    this.demoSeq = (this.demoSeq || 0) + 1;
+    this.lastDemo = { victim: victim.id, attacker: attacker.id };
+    victim.vel.set(0, 0, 0); victim.angVel.set(0, 0, 0);
+    victim.boosting = false; victim.dodgeTime = 0;
+    this.event({ type: 'demo', victim: victim.id, attacker: attacker.id, x: victim.pos.x, y: victim.pos.y, z: victim.pos.z });
+    if (this.authoritative) { const st = this.stats.get(attacker.id); if (st) { st.demos++; st.score += 25; } }
+  }
+
+  respawn(car) {
+    const spawns = this.arena.kickoffSpawns(car.team, 5, () => 0);
+    const pick = [spawns[2], spawns[3], spawns[4]][(car.id + this.tick) % 3];
+    car.placeAt(pick.pos, pick.yaw);
+    car.boost = this.startBoost;
+    car.frozen = this.match.state === 'countdown';
+    this.event({ type: 'respawn', car: car.id });
+  }
+
   updatePads(dt) {
     const pads = this.arena.pads;
     for (let i = 0; i < pads.length; i++) {
@@ -202,7 +238,7 @@ export class World {
       const n = this.cars.length, rev = (this.tick + i) & 1;
       for (let k = 0; k < n; k++) {
         const car = this.cars[rev ? n - 1 - k : k];
-        if (car.frozen || car.boost >= 100) continue;
+        if (car.frozen || car.demoT > 0 || car.boost >= 100) continue;
         const dx = car.pos.x - pad.x, dz = car.pos.z - pad.z;
         if (dx * dx + dz * dz > pad.radius * pad.radius || car.pos.y - pad.y > pad.height) continue;
         const before = car.boost;
@@ -340,6 +376,7 @@ export class World {
       c.boost = round(c.boost, 100);
       c.jumpClock = round(c.jumpClock, 1000); c.dodgeTime = round(c.dodgeTime, 1000);
       c.boostTime = round(c.boostTime, 1000); c.jumpBuffer = round(c.jumpBuffer, 1000); c.airTime = round(c.airTime, 100);
+      c.demoT = round(c.demoT, 1000); c.dodgeF = round(c.dodgeF, 10000); c.dodgeS = round(c.dodgeS, 10000);
       c.updateAxes();
     }
     const m = this.match;
@@ -352,14 +389,16 @@ export class World {
     const lg = m.lastGoal;
     const match = [SC[m.state], m.timer, m.clock, m.overtime ? 1 : 0, m.score[0], m.score[1], m.kickoffs, m.goalSeq,
       lg ? lg.team : -1, lg ? lg.scorer : -1, lg ? lg.assist : -1, lg ? lg.speed : 0, m.waitingGround ? 1 : 0, this.ballHidden ? 1 : 0,
-      this.lastTouch ? this.lastTouch.id : -1, this.lastTouch ? this.tick - this.lastTouch.tick : 0];
+      this.lastTouch ? this.lastTouch.id : -1, this.lastTouch ? this.tick - this.lastTouch.tick : 0,
+      this.demoSeq, this.lastDemo ? this.lastDemo.victim : -1, this.lastDemo ? this.lastDemo.attacker : -1];
     const ball = [b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.angVel.x, b.angVel.y, b.angVel.z];
     const cars = this.cars.map((c) => {
       const flags = (c.onGround ? 1 : 0) | (c.jumped ? 2 : 0) | (c.jumping ? 4 : 0) | (c.doubleJumped ? 8 : 0) |
-        (c.boosting ? 16 : 0) | (c.frozen ? 32 : 0) | (c.prevButtons << 6);
+        (c.boosting ? 16 : 0) | (c.frozen ? 32 : 0) | (c.prevButtons << 6) | (c.supersonic ? 512 : 0);
       return [c.id, c.team, c.pos.x, c.pos.y, c.pos.z, c.rot.x, c.rot.y, c.rot.z, c.rot.w,
         c.vel.x, c.vel.y, c.vel.z, c.angVel.x, c.angVel.y, c.angVel.z, c.boost, flags,
-        c.jumpClock, c.dodgeTime, c.boostTime, c.jumpBuffer, c.airTime, Math.min(9999, this.tick - c.lastKickTick), packInput(c.input)];
+        c.jumpClock, c.dodgeTime, c.boostTime, c.jumpBuffer, c.airTime, Math.min(9999, this.tick - c.lastKickTick), packInput(c.input),
+        c.demoT, c.dodgeF, c.dodgeS];
     });
     const pads = [];
     for (let i = 0; i < this.pads.length; i++) if (this.pads[i] > 0) pads.push(i, this.pads[i]);
@@ -375,6 +414,7 @@ export class World {
     m.lastGoal = match[8] >= 0 ? { team: match[8], scorer: match[9], assist: match[10], speed: match[11] } : null;
     m.waitingGround = !!match[12]; this.ballHidden = !!match[13];
     this.lastTouch = match[14] >= 0 ? { id: match[14], team: -1, tick: tick - match[15] } : null;
+    this.demoSeq = match[16] || 0; this.lastDemo = match[17] >= 0 ? { victim: match[17], attacker: match[18] } : null;
     const b = this.ball;
     b.pos.set(ball[0], ball[1], ball[2]); b.vel.set(ball[3], ball[4], ball[5]); b.angVel.set(ball[6], ball[7], ball[8]);
     const seen = new Set();
@@ -387,10 +427,11 @@ export class World {
       c.vel.set(a[9], a[10], a[11]); c.angVel.set(a[12], a[13], a[14]); c.boost = a[15];
       const f = a[16];
       c.onGround = !!(f & 1); c.jumped = !!(f & 2); c.jumping = !!(f & 4); c.doubleJumped = !!(f & 8);
-      c.boosting = !!(f & 16); c.frozen = !!(f & 32); c.prevButtons = (f >> 6) & 7;
+      c.boosting = !!(f & 16); c.frozen = !!(f & 32); c.prevButtons = (f >> 6) & 7; c.supersonic = !!(f & 512);
       c.jumpClock = a[17]; c.dodgeTime = a[18]; c.boostTime = a[19]; c.jumpBuffer = a[20]; c.airTime = a[21];
       c.lastKickTick = tick - a[22];
       c.input = unpackInput(a[23]);
+      c.demoT = a[24] || 0; c.dodgeF = a[25] || 0; c.dodgeS = a[26] || 0;
       this.inputs.set(id, c.input);
       c.updateAxes();
     }

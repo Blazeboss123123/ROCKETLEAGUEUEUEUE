@@ -28,6 +28,7 @@ export const TRAILS = {
   arc: { rate: 110, life: 0.25, size: [0.14, 0.08], colors: [0xffffff, 0x67e8f9, 0xa78bfa], spread: 0.35, speed: 4, gravity: 0, jitter: 6 },
   vapour: { rate: 50, life: 0.9, size: [0.2, 0.75], colors: [0xe5e7eb, 0x9ca3af], spread: 0.1, speed: 1, gravity: 0.6, alpha: 0.45, normal: true },
   prism: { rate: 70, life: 0.55, size: [0.16, 0.04], colors: [0xf472b6, 0x60a5fa, 0x34d399, 0xfacc15], spread: 0.2, speed: 2, gravity: 0, shape: 1 },
+  supersonic: { rate: 70, life: 0.22, size: [0.09, 0.02], colors: [0xffffff, 0xe0f2fe], spread: 0.02, speed: 6, gravity: 0 },
   aurora: { rate: 90, life: 0.7, size: [0.25, 0.08], colors: [0x34d399, 0x22d3ee, 0xa78bfa], spread: 0.1, speed: 1.5, gravity: 0.4, wave: 1 },
 };
 

@@ -269,3 +269,52 @@ test('ball never tunnels through the arena at max speed', () => {
     w.ballHidden = false;
   }
 });
+
+test('a front flip completes one rotation, lands on its wheels and gains speed', () => {
+  const w = freeWorld(); const c = carAt(w, 0, -40);
+  run(w, 1, inp({ throttle: 1 }));
+  const before = c.vel.len();
+  run(w, 4 / 120, inp({ throttle: 1, jump: true })); run(w, 6 / 120, inp({ throttle: 1 }));
+  run(w, 1 / 120, inp({ throttle: 1, jump: true, pitch: 1 }));
+  let landed = null;
+  for (let i = 0; i < 240 && !landed; i++) { w.setInput(1, inp({ throttle: 1 })); w.step(); if (c.onGround && i > 20) landed = { up: c.up.y, speed: c.vel.len() }; }
+  assert.ok(landed, 'landed');
+  assert.ok(landed.up > 0.95, 'wheels down: up.y=' + landed.up);
+  assert.ok(landed.speed > before + 4.5, `flip added speed: ${before.toFixed(2)} -> ${landed.speed.toFixed(2)}`);
+  run(w, 1, inp({ throttle: 1 }));
+  assert.ok(c.vel.len() > CAR.throttleTopSpeed + 1, 'flip speed is kept above the throttle cap');
+});
+
+test('a flip can be cancelled by pulling back', () => {
+  const w = freeWorld(); const c = carAt(w, 0, -40);
+  run(w, 0.3, inp());
+  for (let i = 0; i < 24; i++) { w.setInput(1, inp({ jump: true })); w.step(); }
+  run(w, 4 / 120, inp());
+  w.setInput(1, inp({ jump: true, pitch: 1 })); w.step();
+  run(w, 0.1, inp({ pitch: -1 }));
+  assert.equal(c.dodgeTime, 0, 'flip rotation stopped');
+  assert.ok(Math.abs(c.angVel.dot(c.left)) < 3, 'no full-speed pitch spin');
+});
+
+test('supersonic hits demolish opponents (not teammates) and they respawn', () => {
+  for (const team of [1, 0]) {
+    const w = freeWorld();
+    const a = carAt(w, 0, -30, 0, 1, 0), b = carAt(w, 0, -22, Math.PI / 2, 2, team);
+    a.vel.set(0, 0, 22.5); a.boost = 100;
+    let demo = null;
+    for (let i = 0; i < 90; i++) { w.setInput(1, inp({ throttle: 1, boost: true })); w.step(); for (const e of w.events) if (e.type === 'demo') demo = e; w.events.length = 0; }
+    if (team === 0) { assert.equal(demo, null, 'no friendly demolitions'); continue; }
+    assert.ok(demo && demo.victim === 2 && demo.attacker === 1, 'opponent demolished');
+    assert.ok(b.demoT > 0, 'victim out of play');
+    run(w, CAR.respawnTime + 0.2, inp());
+    assert.equal(b.demoT, 0, 'respawned');
+    assert.ok(b.pos.z > 30, 'respawned at its own (orange, +z) end: ' + b.pos.z);
+  }
+  // slow bumps never demolish
+  const w = freeWorld();
+  const a = carAt(w, 0, -30, 0, 1, 0), b = carAt(w, 0, -27, Math.PI / 2, 2, 1);
+  a.vel.set(0, 0, 12);
+  let demo = false;
+  for (let i = 0; i < 60; i++) { w.setInput(1, inp({ throttle: 1 })); w.step(); if (w.events.some((e) => e.type === 'demo')) demo = true; w.events.length = 0; }
+  assert.equal(demo, false);
+});

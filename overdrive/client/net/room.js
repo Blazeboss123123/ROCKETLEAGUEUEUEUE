@@ -18,7 +18,7 @@ export const packCos = (c) => COS_KEYS.map((k) => (c && c[k] !== undefined ? c[k
 export const unpackCos = (a) => { const o = {}; if (Array.isArray(a)) COS_KEYS.forEach((k, i) => { if (a[i] !== null && a[i] !== undefined) o[k] = a[i]; }); return o; };
 const packRoster = (r) => r.map((p) => [p.pid, p.name, p.team, p.bot ? 1 : 0, packCos(p.cos)]);
 const unpackRoster = (a) => (Array.isArray(a) ? a.map((p) => ({ pid: p[0], name: p[1], team: p[2], bot: !!p[3], cos: unpackCos(p[4]) })) : []);
-const STAT_KEYS = ['score', 'goals', 'assists', 'saves', 'shots', 'touches', 'boost'];
+const STAT_KEYS = ['score', 'goals', 'assists', 'saves', 'shots', 'touches', 'boost', 'demos'];
 const packStats = (s) => { const o = {}; for (const k in s) o[k] = s[k] ? STAT_KEYS.map((x) => Math.round(s[k][x] || 0)) : null; return o; };
 const unpackStats = (s) => { const o = {}; for (const k in s || {}) o[k] = s[k] ? Object.fromEntries(STAT_KEYS.map((x, i) => [x, s[k][i] || 0])) : null; return o; };
 
