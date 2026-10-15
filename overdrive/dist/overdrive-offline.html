@@ -234,6 +234,37 @@ table.stats tr.team-head td { font-family: var(--display); letter-spacing: 0.1em
 
 .board-hint { position: absolute; top: 96px; left: 50%; transform: translateX(-50%); font-family: var(--body); font-size: 0.72em; letter-spacing: 0.12em; color: rgba(226,232,240,0.55); text-transform: uppercase; }
 
+/* ---------- tablet / touch controls ---------- */
+.ui-layer > .touch-ctl { position: absolute; inset: 0; pointer-events: none; z-index: 5; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.touch-ctl.hidden { display: none; }
+.tc-zone { position: absolute; left: 0; top: 18%; bottom: 0; width: 46%; pointer-events: auto; touch-action: none; }
+.tc-base { position: absolute; left: calc(110px * var(--tc-scale)); top: calc(100% - 120px * var(--tc-scale)); width: calc(132px * var(--tc-scale)); height: calc(132px * var(--tc-scale));
+  margin: calc(-66px * var(--tc-scale)) 0 0 calc(-66px * var(--tc-scale)); border-radius: 50%; border: 2px solid rgba(255,255,255,0.35);
+  background: radial-gradient(circle, rgba(255,255,255,0.10), rgba(10,14,26,0.35)); opacity: calc(var(--tc-alpha) * 0.8); transition: opacity .15s; }
+.tc-base.active { opacity: calc(var(--tc-alpha) + 0.25); }
+.tc-knob { position: absolute; left: 50%; top: 50%; width: 46%; height: 46%; margin: -23% 0 0 -23%; border-radius: 50%;
+  background: radial-gradient(circle at 40% 35%, #ffffff, #b9c3d6); box-shadow: 0 4px 14px rgba(0,0,0,0.45); }
+.tc-btn { position: absolute; pointer-events: auto; touch-action: none; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font-family: var(--display); font-weight: 700; letter-spacing: 0.08em; color: #fff; font-size: calc(14px * var(--tc-scale));
+  border: 2px solid rgba(255,255,255,0.45); background: rgba(10,14,26,0.45); opacity: var(--tc-alpha); box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+  width: calc(var(--d) * var(--tc-scale)); height: calc(var(--d) * var(--tc-scale)); transition: transform .06s, background .06s; }
+.tc-btn.on { transform: scale(0.92); opacity: calc(var(--tc-alpha) + 0.3); }
+.tc-btn.jump { --d: 104px; right: calc(28px * var(--tc-scale)); bottom: calc(44px * var(--tc-scale)); background: radial-gradient(circle at 40% 35%, rgba(96,165,250,0.75), rgba(29,78,216,0.55)); }
+.tc-btn.boost { --d: 88px; right: calc(150px * var(--tc-scale)); bottom: calc(22px * var(--tc-scale)); background: radial-gradient(circle at 40% 35%, rgba(253,186,116,0.85), rgba(234,88,12,0.6)); }
+.tc-btn.slide { --d: 70px; right: calc(170px * var(--tc-scale)); bottom: calc(128px * var(--tc-scale)); }
+.tc-btn.cam { --d: 60px; right: calc(52px * var(--tc-scale)); bottom: calc(166px * var(--tc-scale)); font-size: calc(12px * var(--tc-scale)); }
+.tc-btn.small { --d: 46px; top: 14px; font-size: 20px; border-radius: 12px; }
+.tc-btn.pause { left: 14px; }
+.tc-btn.board { left: 68px; }
+.tc-btn.lit { background: rgba(56,189,248,0.55); }
+/* move the boost meter out from under the buttons */
+body.touch-mode .hud .boost { right: auto; left: 50%; bottom: 10px; width: 110px; height: 110px; transform: translateX(-50%); }
+body.touch-mode .hud .boost .num { font-size: 2em; }
+body.touch-mode .hud .board-hint { display: none; }
+body.touch-mode .hud .feed { top: 70px; bottom: auto; left: 128px; width: 300px; }
+html, body { overscroll-behavior: none; }
+body { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+
 </style>
 <div id="app"><div class="ui-layer"></div></div>
 <noscript>Project Overdrive needs JavaScript and WebGL.</noscript>
@@ -5846,6 +5877,18 @@ class InputManager {
     ui.lookBack = this.isDown('lookBack');
     ui.scoreboard = this.isDown('scoreboard');
     ui.pause = this.edge('pause');
+    // on-screen tablet controls (stick up = accelerate / pitch down, like W)
+    if (this.touch?.visible) {
+      const t = this.touch.read();
+      this.lastDevice = 'touch';
+      if (Math.abs(t.x) > Math.abs(out.steer)) { out.steer = clamp1(t.x * s.steerSensitivity); out.yaw = out.steer; }
+      if (Math.abs(t.y) > Math.abs(out.throttle)) out.throttle = clamp1(-t.y);
+      if (Math.abs(t.y) > Math.abs(out.pitch)) out.pitch = clamp1(-t.y * s.aerialSensitivity) * (s.invertPitch ? -1 : 1);
+      out.jump = out.jump || t.jump; out.boost = out.boost || t.boost; out.slide = out.slide || t.slide;
+      ui.ballCamToggle = ui.ballCamToggle || t.ballCam;
+      ui.scoreboard = ui.scoreboard || t.scoreboard;
+      ui.pause = ui.pause || t.pause;
+    }
     ui.chat = this.edge('chat');
     if (ui.ballCamToggle) this.ballCam = !this.ballCam;
     ui.ballCam = this.ballCam;
@@ -6098,6 +6141,7 @@ const DEFAULT_SETTINGS = {
   // camera
   fov: 108, distance: 3.0, height: 1.05, speedFov: 6, stiffness: 0.45, swivelSpeed: 4.5, transitionSpeed: 1.2, cameraShake: false, ballCamDefault: true,
   // controls
+  touchControls: 'auto', touchScale: 1, touchOpacity: 0.6, touchHaptics: true,
   mouseSensitivity: 1, steerSensitivity: 1, aerialSensitivity: 1, deadzone: 0.12, invertPitch: false,
   // audio
   volMaster: 0.8, volMusic: 0.5, volEffects: 0.8,
@@ -6823,6 +6867,127 @@ class HUD {
 return { HUD };
 })();
 
+// ---- client/ui/touch.js
+__m["client/ui/touch.js"] = (() => {
+// Tablet / touch-screen controls: a floating joystick on the left half of the screen and a
+// button cluster on the right. Multi-touch: every finger is tracked by its pointer id.
+//
+//   Joystick  up/down = accelerate/reverse (pitch in the air), left/right = steer (yaw in the air)
+//   JUMP      jump; tap again with the stick tilted to dodge/flip
+//   BOOST     hold
+//   DRIFT     hold: powerslide on the ground, air roll (with the stick) in the air
+//   CAM       ball cam on/off       ☰ pause       ▤ scoreboard (toggle)
+const { h } = __m["client/ui/dom.js"];
+
+function touchPreferred() {
+  try { return window.matchMedia('(pointer: coarse)').matches || (navigator.maxTouchPoints > 0 && !window.matchMedia('(pointer: fine)').matches); } catch { return false; }
+}
+
+class TouchControls {
+  constructor(settings) {
+    this.settings = settings;
+    this.stick = { x: 0, y: 0, id: null, ox: 0, oy: 0 };
+    this.held = new Set();          // jump, boost, slide
+    this.edges = new Set();         // ballCam, pause
+    this.board = false;             // scoreboard toggle
+    this.visible = false;
+    const R = 60; // stick travel in CSS px (scaled with the setting)
+    this.R = R;
+
+    this.base = h('div', { class: 'tc-base' }, this.knob = h('div', { class: 'tc-knob' }));
+    this.zone = h('div', { class: 'tc-zone', 'aria-label': 'Steering joystick' }, this.base);
+    const btn = (id, label, cls, kind) => {
+      const b = h('div', { class: 'tc-btn ' + cls, role: 'button', 'aria-label': label }, label);
+      b.addEventListener('pointerdown', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        try { b.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+        b.classList.add('on');
+        if (kind === 'hold') this.held.add(id);
+        else if (kind === 'toggle') { this.board = !this.board; b.classList.toggle('lit', this.board); }
+        else this.edges.add(id);
+        if (navigator.vibrate && this.settings.touchHaptics !== false) { try { navigator.vibrate(8); } catch { /* ignore */ } }
+      });
+      const up = (e) => { e.preventDefault(); b.classList.remove('on'); if (kind === 'hold') this.held.delete(id); };
+      b.addEventListener('pointerup', up);
+      b.addEventListener('pointercancel', up);
+      b.addEventListener('lostpointercapture', () => { b.classList.remove('on'); if (kind === 'hold') this.held.delete(id); });
+      return b;
+    };
+    this.jumpBtn = btn('jump', 'JUMP', 'jump', 'hold');
+    this.boostBtn = btn('boost', 'BOOST', 'boost', 'hold');
+    this.slideBtn = btn('slide', 'DRIFT', 'slide', 'hold');
+    this.camBtn = btn('ballCam', 'CAM', 'cam', 'edge');
+    this.pauseBtn = btn('pause', '☰', 'pause small', 'edge');
+    this.boardBtn = btn('scoreboard', '▤', 'board small', 'toggle');
+    this.root = h('div', { class: 'touch-ctl hidden' }, this.zone, this.jumpBtn, this.boostBtn, this.slideBtn, this.camBtn, this.pauseBtn, this.boardBtn);
+
+    // joystick: appears where the thumb lands anywhere in the left zone
+    this.zone.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      if (this.stick.id !== null) return;
+      try { this.zone.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+      const r = this.zone.getBoundingClientRect();
+      this.stick.id = e.pointerId;
+      this.stick.ox = e.clientX - r.left; this.stick.oy = e.clientY - r.top;
+      this.base.style.left = this.stick.ox + 'px'; this.base.style.top = this.stick.oy + 'px';
+      this.base.classList.add('active');
+      this.move(e);
+    });
+    this.zone.addEventListener('pointermove', (e) => { if (e.pointerId === this.stick.id) { e.preventDefault(); this.move(e); } });
+    const end = (e) => { if (e.pointerId === this.stick.id) this.releaseStick(); };
+    this.zone.addEventListener('pointerup', end);
+    this.zone.addEventListener('pointercancel', end);
+    this.zone.addEventListener('lostpointercapture', end);
+    this.root.addEventListener('contextmenu', (e) => e.preventDefault());
+    this.applyLayout();
+  }
+
+  move(e) {
+    const r = this.zone.getBoundingClientRect();
+    const R = this.R * (this.settings.touchScale || 1);
+    let dx = e.clientX - r.left - this.stick.ox, dy = e.clientY - r.top - this.stick.oy;
+    const l = Math.hypot(dx, dy);
+    if (l > R) { dx *= R / l; dy *= R / l; }
+    this.knob.style.transform = `translate(${dx}px, ${dy}px)`;
+    // small deadzone, then full range; a slight curve gives finer steering near the centre
+    const curve = (v) => { const a = Math.abs(v); const d = 0.12; if (a < d) return 0; const k = (a - d) / (1 - d); return Math.sign(v) * (0.35 * k + 0.65 * k * k); };
+    this.stick.x = curve(dx / R);
+    this.stick.y = curve(dy / R);
+  }
+
+  releaseStick() {
+    this.stick.id = null; this.stick.x = 0; this.stick.y = 0;
+    this.knob.style.transform = '';
+    this.base.classList.remove('active');
+    this.base.style.left = ''; this.base.style.top = '';
+  }
+
+  applyLayout() {
+    const s = this.settings;
+    this.root.style.setProperty('--tc-scale', s.touchScale || 1);
+    this.root.style.setProperty('--tc-alpha', s.touchOpacity ?? 0.6);
+  }
+
+  setVisible(v) {
+    if (v === this.visible) return;
+    this.visible = v;
+    this.root.classList.toggle('hidden', !v);
+    document.body.classList.toggle('touch-mode', v);
+    if (!v) { this.releaseStick(); this.held.clear(); this.edges.clear(); this.board = false; this.boardBtn.classList.remove('lit'); }
+  }
+
+  // merged into InputManager.sample()
+  read() {
+    const out = { x: this.stick.x, y: this.stick.y, jump: this.held.has('jump'), boost: this.held.has('boost'), slide: this.held.has('slide'),
+      ballCam: this.edges.has('ballCam'), pause: this.edges.has('pause'), scoreboard: this.board };
+    this.edges.clear();
+    return out;
+  }
+}
+
+return { touchPreferred, TouchControls };
+})();
+
 // ---- client/ui/screens.js
 __m["client/ui/screens.js"] = (() => {
 // Menu screens: main, play, private match, practice, training, matchmaking, lobby, results,
@@ -7176,7 +7341,7 @@ const { DEFAULT_SETTINGS } = __m["client/profile.js"];
 
 function settingsScreen(app, params = {}) {
   const S = app.settings;
-  const tabs = [['video', 'Video'], ['camera', 'Camera'], ['controls', 'Controls'], ['audio', 'Audio'], ['access', 'Accessibility'], ['network', 'Network']];
+  const tabs = [['video', 'Video'], ['camera', 'Camera'], ['controls', 'Controls'], ['touch', 'Tablet'], ['audio', 'Audio'], ['access', 'Accessibility'], ['network', 'Network']];
   let tab = params.tab || 'video';
   const list = h('div', { class: 'setlist panel' });
   const nav = h('div', { class: 'col' });
@@ -7215,6 +7380,16 @@ function settingsScreen(app, params = {}) {
       row('Ball cam on at start', null, tog('ballCamDefault')),
     ],
     controls: () => controlsPage(app, row, slider, tog),
+    touch: () => [
+      row('Tablet controls', 'On-screen joystick and buttons for touch screens. Auto turns them on when this device has a touch screen and no mouse.', choice('touchControls', [['auto', 'Auto'], ['on', 'On'], ['off', 'Off']])),
+      row('Button size', null, slider('touchScale', 0.7, 1.4, 0.05, (v) => Math.round(v * 100) + '%')),
+      row('Opacity', 'How see-through the on-screen controls are', slider('touchOpacity', 0.2, 1, 0.05, (v) => Math.round(v * 100) + '%')),
+      row('Vibrate on press', 'Short buzz when a button is pressed (Android only)', tog('touchHaptics')),
+      h('div', { class: 'small muted', style: { padding: '12px 4px', lineHeight: '1.6' } },
+        h('b', null, 'Left thumb: '), 'touch anywhere on the left half to get a joystick. Push up to drive, down to reverse, sideways to steer. In the air it tilts and turns the car.', h('br'),
+        h('b', null, 'Right thumb: '), 'JUMP (tap again with the stick pushed to flip), BOOST (hold), DRIFT (hold to powerslide, or to air roll in the air), CAM toggles ball cam.', h('br'),
+        h('b', null, 'Top left: '), '☰ pause menu, ▤ scoreboard.'),
+    ],
     audio: () => [
       row('Master volume', null, slider('volMaster', 0, 1, 0.05, (v) => Math.round(v * 100))),
       row('Music volume', 'Menu music', slider('volMusic', 0, 1, 0.05, (v) => Math.round(v * 100))),
@@ -7435,6 +7610,7 @@ const { TrainingSession, DRILLS } = __m["client/training.js"];
 const { getRoom, RoomHost, RoomClientConn, findPublicMatch, shouldYield } = __m["client/net/room.js"];
 const { h, clear, toast } = __m["client/ui/dom.js"];
 const { HUD } = __m["client/ui/hud.js"];
+const { TouchControls, touchPreferred } = __m["client/ui/touch.js"];
 const screens = __m["client/ui/screens.js"];
 const { settingsScreen } = __m["client/ui/settings.js"];
 const { garageScreen } = __m["client/ui/garage.js"];
@@ -7490,6 +7666,9 @@ class App {
     this.renderer.applyQuality(this.settings.quality);
     this.renderer.setShowroomCar(this.profile.loadout, 0);
     this.input = new InputManager(this.settings);
+    this.touch = new TouchControls(this.settings);
+    this.input.touch = this.touch;
+    this.ui.appendChild(this.touch.root);
     this.audio = new AudioEngine(this.settings);
     this.hud = new HUD(this);
     this.replay = new Replay();
@@ -7578,6 +7757,7 @@ class App {
     saveSettings(s);
     if (key === 'quality' || key === 'renderScale' || key === 'postFx' || key === '*') this.renderer.applyQuality(s.quality);
     if (key.startsWith?.('vol') || key === '*') this.audio.applyVolumes();
+    if (key.startsWith?.('touch') || key === '*') this.touch?.applyLayout();
     if (key === 'uiScale' || key === '*') document.documentElement.style.setProperty('--ui-scale', s.uiScale);
     if (key === 'colorblind' || key === '*') {
       this.colors = s.colorblind ? TEAM_COLORS_ALT : TEAM_COLORS;
@@ -7765,6 +7945,7 @@ class App {
     this.frames++; this.fpsT += dt;
     if (this.fpsT > 0.5) { this.fpsEl.textContent = `${Math.round(this.frames / this.fpsT)} fps`; this.frames = 0; this.fpsT = 0; }
     try {
+      this.touch.setVisible(this.touchWanted() && ((this.mode === 'session' && this.inMatchView) || this.mode === 'training') && !this.paused && !this.resultsEl && !this.screen);
       const { controls, ui } = this.input.sample();
       if (this.mode === 'session') this.sessionFrame(dt, controls, ui, now / 1000);
       else if (this.mode === 'training') this.trainingFrame(dt, controls, ui, now / 1000);
@@ -7775,6 +7956,8 @@ class App {
       console.error(e);
     }
   }
+
+  touchWanted() { const m = this.settings.touchControls; return m === 'on' || (m !== 'off' && touchPreferred()); }
 
   handleCommonUi(ui) {
     if (ui.pause) { if (this.pauseEl) this.hidePause(); else if (!this.screen) this.showPause(); }

@@ -168,6 +168,18 @@ export class InputManager {
     ui.lookBack = this.isDown('lookBack');
     ui.scoreboard = this.isDown('scoreboard');
     ui.pause = this.edge('pause');
+    // on-screen tablet controls (stick up = accelerate / pitch down, like W)
+    if (this.touch?.visible) {
+      const t = this.touch.read();
+      this.lastDevice = 'touch';
+      if (Math.abs(t.x) > Math.abs(out.steer)) { out.steer = clamp1(t.x * s.steerSensitivity); out.yaw = out.steer; }
+      if (Math.abs(t.y) > Math.abs(out.throttle)) out.throttle = clamp1(-t.y);
+      if (Math.abs(t.y) > Math.abs(out.pitch)) out.pitch = clamp1(-t.y * s.aerialSensitivity) * (s.invertPitch ? -1 : 1);
+      out.jump = out.jump || t.jump; out.boost = out.boost || t.boost; out.slide = out.slide || t.slide;
+      ui.ballCamToggle = ui.ballCamToggle || t.ballCam;
+      ui.scoreboard = ui.scoreboard || t.scoreboard;
+      ui.pause = ui.pause || t.pause;
+    }
     ui.chat = this.edge('chat');
     if (ui.ballCamToggle) this.ballCam = !this.ballCam;
     ui.ballCam = this.ballCam;

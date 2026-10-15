@@ -6,7 +6,7 @@ import { DEFAULT_SETTINGS } from '../profile.js';
 
 export function settingsScreen(app, params = {}) {
   const S = app.settings;
-  const tabs = [['video', 'Video'], ['camera', 'Camera'], ['controls', 'Controls'], ['audio', 'Audio'], ['access', 'Accessibility'], ['network', 'Network']];
+  const tabs = [['video', 'Video'], ['camera', 'Camera'], ['controls', 'Controls'], ['touch', 'Tablet'], ['audio', 'Audio'], ['access', 'Accessibility'], ['network', 'Network']];
   let tab = params.tab || 'video';
   const list = h('div', { class: 'setlist panel' });
   const nav = h('div', { class: 'col' });
@@ -45,6 +45,16 @@ export function settingsScreen(app, params = {}) {
       row('Ball cam on at start', null, tog('ballCamDefault')),
     ],
     controls: () => controlsPage(app, row, slider, tog),
+    touch: () => [
+      row('Tablet controls', 'On-screen joystick and buttons for touch screens. Auto turns them on when this device has a touch screen and no mouse.', choice('touchControls', [['auto', 'Auto'], ['on', 'On'], ['off', 'Off']])),
+      row('Button size', null, slider('touchScale', 0.7, 1.4, 0.05, (v) => Math.round(v * 100) + '%')),
+      row('Opacity', 'How see-through the on-screen controls are', slider('touchOpacity', 0.2, 1, 0.05, (v) => Math.round(v * 100) + '%')),
+      row('Vibrate on press', 'Short buzz when a button is pressed (Android only)', tog('touchHaptics')),
+      h('div', { class: 'small muted', style: { padding: '12px 4px', lineHeight: '1.6' } },
+        h('b', null, 'Left thumb: '), 'touch anywhere on the left half to get a joystick. Push up to drive, down to reverse, sideways to steer. In the air it tilts and turns the car.', h('br'),
+        h('b', null, 'Right thumb: '), 'JUMP (tap again with the stick pushed to flip), BOOST (hold), DRIFT (hold to powerslide, or to air roll in the air), CAM toggles ball cam.', h('br'),
+        h('b', null, 'Top left: '), '☰ pause menu, ▤ scoreboard.'),
+    ],
     audio: () => [
       row('Master volume', null, slider('volMaster', 0, 1, 0.05, (v) => Math.round(v * 100))),
       row('Music volume', 'Menu music', slider('volMusic', 0, 1, 0.05, (v) => Math.round(v * 100))),

@@ -64,6 +64,8 @@ node tools/build-artifact.mjs --local-three  # dist/overdrive-offline.html (full
 | Quick chat | T, then 1–9 | D-pad up |
 | Pause | Esc | Menu |
 
+**Tablets / touch screens** (Settings → Tablet: Auto / On / Off, button size, opacity): touch anywhere on the left half for a joystick (up = drive, down = reverse, sideways = steer; tilt and turn in the air). On the right: JUMP (tap again with the stick pushed to flip), BOOST (hold), DRIFT (hold: powerslide / air roll), CAM (ball cam). Top left: pause and scoreboard. Auto turns them on for devices with a touch screen and no mouse.
+
 Binding a key that's already in use swaps the two actions (and tells you), so nothing is left conflicting. Jumps pressed up to 0.1 s before landing are buffered.
 
 ## Units and coordinates

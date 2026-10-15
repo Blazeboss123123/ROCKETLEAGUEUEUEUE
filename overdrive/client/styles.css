@@ -223,3 +223,34 @@ table.stats tr.team-head td { font-family: var(--display); letter-spacing: 0.1em
 }
 
 .board-hint { position: absolute; top: 96px; left: 50%; transform: translateX(-50%); font-family: var(--body); font-size: 0.72em; letter-spacing: 0.12em; color: rgba(226,232,240,0.55); text-transform: uppercase; }
+
+/* ---------- tablet / touch controls ---------- */
+.ui-layer > .touch-ctl { position: absolute; inset: 0; pointer-events: none; z-index: 5; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.touch-ctl.hidden { display: none; }
+.tc-zone { position: absolute; left: 0; top: 18%; bottom: 0; width: 46%; pointer-events: auto; touch-action: none; }
+.tc-base { position: absolute; left: calc(110px * var(--tc-scale)); top: calc(100% - 120px * var(--tc-scale)); width: calc(132px * var(--tc-scale)); height: calc(132px * var(--tc-scale));
+  margin: calc(-66px * var(--tc-scale)) 0 0 calc(-66px * var(--tc-scale)); border-radius: 50%; border: 2px solid rgba(255,255,255,0.35);
+  background: radial-gradient(circle, rgba(255,255,255,0.10), rgba(10,14,26,0.35)); opacity: calc(var(--tc-alpha) * 0.8); transition: opacity .15s; }
+.tc-base.active { opacity: calc(var(--tc-alpha) + 0.25); }
+.tc-knob { position: absolute; left: 50%; top: 50%; width: 46%; height: 46%; margin: -23% 0 0 -23%; border-radius: 50%;
+  background: radial-gradient(circle at 40% 35%, #ffffff, #b9c3d6); box-shadow: 0 4px 14px rgba(0,0,0,0.45); }
+.tc-btn { position: absolute; pointer-events: auto; touch-action: none; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font-family: var(--display); font-weight: 700; letter-spacing: 0.08em; color: #fff; font-size: calc(14px * var(--tc-scale));
+  border: 2px solid rgba(255,255,255,0.45); background: rgba(10,14,26,0.45); opacity: var(--tc-alpha); box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+  width: calc(var(--d) * var(--tc-scale)); height: calc(var(--d) * var(--tc-scale)); transition: transform .06s, background .06s; }
+.tc-btn.on { transform: scale(0.92); opacity: calc(var(--tc-alpha) + 0.3); }
+.tc-btn.jump { --d: 104px; right: calc(28px * var(--tc-scale)); bottom: calc(44px * var(--tc-scale)); background: radial-gradient(circle at 40% 35%, rgba(96,165,250,0.75), rgba(29,78,216,0.55)); }
+.tc-btn.boost { --d: 88px; right: calc(150px * var(--tc-scale)); bottom: calc(22px * var(--tc-scale)); background: radial-gradient(circle at 40% 35%, rgba(253,186,116,0.85), rgba(234,88,12,0.6)); }
+.tc-btn.slide { --d: 70px; right: calc(170px * var(--tc-scale)); bottom: calc(128px * var(--tc-scale)); }
+.tc-btn.cam { --d: 60px; right: calc(52px * var(--tc-scale)); bottom: calc(166px * var(--tc-scale)); font-size: calc(12px * var(--tc-scale)); }
+.tc-btn.small { --d: 46px; top: 14px; font-size: 20px; border-radius: 12px; }
+.tc-btn.pause { left: 14px; }
+.tc-btn.board { left: 68px; }
+.tc-btn.lit { background: rgba(56,189,248,0.55); }
+/* move the boost meter out from under the buttons */
+body.touch-mode .hud .boost { right: auto; left: 50%; bottom: 10px; width: 110px; height: 110px; transform: translateX(-50%); }
+body.touch-mode .hud .boost .num { font-size: 2em; }
+body.touch-mode .hud .board-hint { display: none; }
+body.touch-mode .hud .feed { top: 70px; bottom: auto; left: 128px; width: 300px; }
+html, body { overscroll-behavior: none; }
+body { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }

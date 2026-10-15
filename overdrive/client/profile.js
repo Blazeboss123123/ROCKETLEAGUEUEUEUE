@@ -9,6 +9,7 @@ export const DEFAULT_SETTINGS = {
   // camera
   fov: 108, distance: 3.0, height: 1.05, speedFov: 6, stiffness: 0.45, swivelSpeed: 4.5, transitionSpeed: 1.2, cameraShake: false, ballCamDefault: true,
   // controls
+  touchControls: 'auto', touchScale: 1, touchOpacity: 0.6, touchHaptics: true,
   mouseSensitivity: 1, steerSensitivity: 1, aerialSensitivity: 1, deadzone: 0.12, invertPitch: false,
   // audio
   volMaster: 0.8, volMusic: 0.5, volEffects: 0.8,

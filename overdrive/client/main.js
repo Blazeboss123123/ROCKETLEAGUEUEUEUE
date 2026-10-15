@@ -17,6 +17,7 @@ import { TrainingSession, DRILLS } from './training.js';
 import { getRoom, RoomHost, RoomClientConn, findPublicMatch, shouldYield } from './net/room.js';
 import { h, clear, toast } from './ui/dom.js';
 import { HUD } from './ui/hud.js';
+import { TouchControls, touchPreferred } from './ui/touch.js';
 import * as screens from './ui/screens.js';
 import { settingsScreen } from './ui/settings.js';
 import { garageScreen } from './ui/garage.js';
@@ -72,6 +73,9 @@ class App {
     this.renderer.applyQuality(this.settings.quality);
     this.renderer.setShowroomCar(this.profile.loadout, 0);
     this.input = new InputManager(this.settings);
+    this.touch = new TouchControls(this.settings);
+    this.input.touch = this.touch;
+    this.ui.appendChild(this.touch.root);
     this.audio = new AudioEngine(this.settings);
     this.hud = new HUD(this);
     this.replay = new Replay();
@@ -160,6 +164,7 @@ class App {
     saveSettings(s);
     if (key === 'quality' || key === 'renderScale' || key === 'postFx' || key === '*') this.renderer.applyQuality(s.quality);
     if (key.startsWith?.('vol') || key === '*') this.audio.applyVolumes();
+    if (key.startsWith?.('touch') || key === '*') this.touch?.applyLayout();
     if (key === 'uiScale' || key === '*') document.documentElement.style.setProperty('--ui-scale', s.uiScale);
     if (key === 'colorblind' || key === '*') {
       this.colors = s.colorblind ? TEAM_COLORS_ALT : TEAM_COLORS;
@@ -347,6 +352,7 @@ class App {
     this.frames++; this.fpsT += dt;
     if (this.fpsT > 0.5) { this.fpsEl.textContent = `${Math.round(this.frames / this.fpsT)} fps`; this.frames = 0; this.fpsT = 0; }
     try {
+      this.touch.setVisible(this.touchWanted() && ((this.mode === 'session' && this.inMatchView) || this.mode === 'training') && !this.paused && !this.resultsEl && !this.screen);
       const { controls, ui } = this.input.sample();
       if (this.mode === 'session') this.sessionFrame(dt, controls, ui, now / 1000);
       else if (this.mode === 'training') this.trainingFrame(dt, controls, ui, now / 1000);
@@ -357,6 +363,8 @@ class App {
       console.error(e);
     }
   }
+
+  touchWanted() { const m = this.settings.touchControls; return m === 'on' || (m !== 'off' && touchPreferred()); }
 
   handleCommonUi(ui) {
     if (ui.pause) { if (this.pauseEl) this.hidePause(); else if (!this.screen) this.showPause(); }
