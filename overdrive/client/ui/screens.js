@@ -1,7 +1,7 @@
 // Menu screens: main, play, private match, practice, training, matchmaking, lobby, results,
 // profile, statistics, credits, exit.
 import { h, clear, seg, toast, bannerStyle, fmtDuration } from './dom.js';
-import { MODES, BOTS, TEAM_COLORS } from '../../shared/config.js';
+import { MODES, BOTS, TEAM_COLORS, GAME_MODES, ARENA_VARIANTS, arenasForMode } from '../../shared/config.js';
 import { CODE_RE } from '../../shared/protocol.js';
 import { DRILLS } from '../training.js';
 import { ARENA_THEMES } from '../render/arenaMesh.js';
@@ -50,6 +50,30 @@ export function mainMenu(app) {
   return { el };
 }
 
+// Game mode selector (Soccar / Hoops / Dropshot) with a one-line description.
+function gamePicker(app, key, onChange) {
+  const blurb = h('div', { class: 'small muted' }, GAME_MODES[app.prefs[key]]?.blurb || '');
+  return h('div', { class: 'col' },
+    seg(Object.entries(GAME_MODES).map(([id, g]) => [id, g.name]), app.prefs[key], (v) => { app.prefs[key] = v; app.savePrefs(); blurb.textContent = GAME_MODES[v].blurb; onChange?.(v); }),
+    blurb);
+}
+
+// Arena picker filtered to the maps of the selected game mode; re-renders when the mode changes.
+function arenaPicker(app, key, gameKey, competitiveOnly = false) {
+  const box = h('div', { class: 'col' });
+  const render = () => {
+    clear(box);
+    const game = app.prefs[gameKey] || 'soccar';
+    const ids = arenasForMode(game).filter((id) => !competitiveOnly || ARENA_VARIANTS[id].competitive);
+    if (!ids.includes(app.prefs[key])) { app.prefs[key] = ids[0]; app.savePrefs(); }
+    const blurb = h('div', { class: 'small muted' }, ARENA_THEMES[app.prefs[key]]?.blurb || '');
+    box.append(seg(ids.map((id) => [id, ARENA_VARIANTS[id].name]), app.prefs[key], (v) => { app.prefs[key] = v; app.savePrefs(); blurb.textContent = ARENA_THEMES[v]?.blurb || ''; }), blurb);
+  };
+  render();
+  box.refresh = render;
+  return box;
+}
+
 export function playMenu(app) {
   const st = app.prefs;
   const modeSel = (key) => seg(Object.keys(MODES).map((m) => [m, m]), st[key], (v) => { st[key] = v; app.savePrefs(); });
@@ -57,25 +81,23 @@ export function playMenu(app) {
   const el = h('div', { class: 'screen solid' },
     h('div', { class: 'topbar' }, back(app), h('h1', null, 'Play'), h('div', { class: 'spacer' }), h('div', { class: 'crumb' }, online ? (app.net.server ? 'Dedicated server' : 'Browser-hosted (shared link)') : 'Offline')),
     h('div', { class: 'tiles' },
-      h('div', { class: 'panel tile' + (online ? '' : ' locked') },
+      h('div', { class: 'panel tile wide' + (online ? '' : ' locked') },
         h('div', { class: 'tag' }, online ? 'Online' : 'Unavailable'),
         h('div', { class: 't' }, 'Casual'),
-        h('p', null, online ? 'Public matchmaking. Empty seats are filled by labelled bots, and players can drop in.' : 'Needs the dedicated server or the shared claude.ai link. Use Practice for offline play.'),
-        h('div', { class: 'row', style: { marginTop: '12px' } }, modeSel('casualMode'),
-          h('button', { class: 'btn primary', disabled: !online, onclick: () => { app.uiClick(); app.playOnline(st.casualMode); } }, 'Find match'))),
-      h('div', { class: 'panel tile locked' },
-        h('div', { class: 'tag' }, 'Requires ranking service'),
-        h('div', { class: 't' }, 'Competitive'),
-        h('p', null, 'Ranked play needs authenticated accounts and a rating service, which this build does not include. See the README for the plan.')),
+        h('p', null, online ? 'Public matchmaking in Soccar, Hoops or Dropshot. Empty seats are filled by labelled bots, and players can drop in.' : 'Needs the dedicated server or the shared claude.ai link. Use Practice for offline play.'),
+        h('div', { class: 'col', style: { marginTop: '12px', gap: '10px' } },
+          gamePicker(app, 'casualGame'),
+          h('div', { class: 'row' }, modeSel('casualMode'),
+            h('button', { class: 'btn primary', disabled: !online, onclick: () => { app.uiClick(); app.playOnline(st.casualMode, st.casualGame); } }, 'Find match')))),
       h('div', { class: 'panel tile' + (online ? '' : ' locked'), onclick: (e) => { if (online && !e.target.closest('button')) app.go('private'); } },
         h('div', { class: 'tag' }, 'Online · Friends'),
         h('div', { class: 't' }, 'Private Match'),
-        h('p', null, 'Create a lobby and share its 6-character code, or join a friend with theirs.'),
+        h('p', null, 'Pick a mode and arena, then share your 6-character code, or join a friend with theirs.'),
         h('div', { class: 'row', style: { marginTop: '12px' } }, h('button', { class: 'btn', disabled: !online, onclick: () => app.go('private') }, 'Create / Join'))),
       h('div', { class: 'panel tile', onclick: (e) => { if (!e.target.closest('button')) app.go('practice'); } },
         h('div', { class: 'tag' }, 'Offline'),
         h('div', { class: 't' }, 'Practice vs Bots'),
-        h('p', null, 'Full match against AI teammates and opponents. Runs entirely on this device.'),
+        h('p', null, 'Any mode on any arena against AI teammates and opponents. Runs entirely on this device.'),
         h('div', { class: 'row', style: { marginTop: '12px' } }, h('button', { class: 'btn', onclick: () => app.go('practice') }, 'Set up'))),
       h('div', { class: 'panel tile', onclick: () => app.go('training') },
         h('div', { class: 'tag' }, 'Offline'),
@@ -84,23 +106,19 @@ export function playMenu(app) {
   return { el };
 }
 
-function arenaPicker(app, key, allowExperimental) {
-  const opts = Object.values(ARENA_THEMES).filter((a) => allowExperimental || !a.params).map((a) => [a.id, a.name]);
-  const blurb = h('div', { class: 'small muted' }, ARENA_THEMES[app.prefs[key]]?.blurb || '');
-  return h('div', { class: 'col' }, seg(opts, app.prefs[key], (v) => { app.prefs[key] = v; app.savePrefs(); blurb.textContent = ARENA_THEMES[v].blurb; }), blurb);
-}
-
 export function practiceMenu(app) {
   const p = app.prefs;
+  const arenas = arenaPicker(app, 'practiceArena', 'practiceGame');
   const el = h('div', { class: 'screen solid' },
     h('div', { class: 'topbar' }, back(app, 'play'), h('h1', null, 'Practice vs Bots'), h('div', { class: 'spacer' }), h('div', { class: 'crumb' }, 'Offline · not an online match')),
-    h('div', { class: 'panel', style: { maxWidth: '760px' } },
+    h('div', { class: 'panel', style: { maxWidth: '820px' } },
       h('div', { class: 'col', style: { gap: '18px' } },
+        h('div', null, h('h3', null, 'Game mode'), gamePicker(app, 'practiceGame', () => arenas.refresh())),
         h('div', null, h('h3', null, 'Format'), seg(Object.keys(MODES).map((m) => [m, MODES[m].label]), p.practiceMode, (v) => { p.practiceMode = v; app.savePrefs(); })),
         h('div', null, h('h3', null, 'Bot difficulty'), seg(Object.entries(BOTS).map(([k, b]) => [k, b.label]), p.practiceBots, (v) => { p.practiceBots = v; app.savePrefs(); })),
-        h('div', null, h('h3', null, 'Arena'), arenaPicker(app, 'practiceArena', true)),
+        h('div', null, h('h3', null, 'Arena'), arenas),
         h('div', null, h('h3', null, 'Match length'), seg([[120, '2 min'], [300, '5 min'], [600, '10 min']], p.practiceLength, (v) => { p.practiceLength = v; app.savePrefs(); })),
-        h('div', { class: 'row' }, h('button', { class: 'btn primary', onclick: () => { app.uiClick(); app.practice({ mode: p.practiceMode, difficulty: p.practiceBots, arena: p.practiceArena, duration: p.practiceLength }); } }, 'Start match')))));
+        h('div', { class: 'row' }, h('button', { class: 'btn primary', onclick: () => { app.uiClick(); app.practice({ mode: p.practiceMode, game: p.practiceGame, difficulty: p.practiceBots, arena: p.practiceArena, duration: p.practiceLength }); } }, 'Start match')))));
   return { el };
 }
 
@@ -114,17 +132,19 @@ export function privateMenu(app) {
     app.joinPrivate(c);
   };
   codeIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') join(); });
+  const privArenas = arenaPicker(app, 'privateArena', 'privateGame');
   const el = h('div', { class: 'screen solid' },
     h('div', { class: 'topbar' }, back(app, 'play'), h('h1', null, 'Private Match')),
     h('div', { class: 'lobby-grid', style: { maxWidth: '1100px' } },
       h('div', { class: 'panel' },
         h('h2', null, 'Create'),
         h('div', { class: 'col', style: { gap: '16px' } },
+          h('div', null, h('h3', null, 'Game mode'), gamePicker(app, 'privateGame', () => privArenas.refresh())),
           h('div', null, h('h3', null, 'Format'), seg(Object.keys(MODES).map((m) => [m, m]), p.privateMode, (v) => { p.privateMode = v; app.savePrefs(); })),
           h('div', null, h('h3', null, 'Fill empty seats with bots'), seg([['off', 'No bots'], ['rookie', 'Rookie'], ['pro', 'Pro'], ['elite', 'Elite']], p.privateFill, (v) => { p.privateFill = v; app.savePrefs(); })),
-          h('div', null, h('h3', null, 'Arena'), arenaPicker(app, 'privateArena', true)),
+          h('div', null, h('h3', null, 'Arena'), privArenas),
           app.net.room && !app.net.server ? h('p', { class: 'small muted' }, 'Your browser will host this match. Keep this tab open and in the foreground while playing; friends join with the code from this same shared link.') : null,
-          h('button', { class: 'btn primary', onclick: () => { app.uiClick(); app.createPrivate({ mode: p.privateMode, fill: p.privateFill, arena: p.privateArena }); } }, 'Create lobby'))),
+          h('button', { class: 'btn primary', onclick: () => { app.uiClick(); app.createPrivate({ mode: p.privateMode, game: p.privateGame, fill: p.privateFill, arena: p.privateArena }); } }, 'Create lobby'))),
       h('div', { class: 'panel' },
         h('h2', null, 'Join'),
         h('div', { class: 'col', style: { gap: '16px' } },
@@ -268,7 +288,7 @@ export function profileScreen(app) {
       h('div', { class: 'panel' },
         h('h2', null, 'Account type'),
         h('p', null, h('b', null, 'Local profile.'), ' Your progress, unlocks and settings are stored in this browser only. There is no sign-in, cloud save or cross-device sync in this build.'),
-        h('p', { class: 'muted small' }, 'Cosmetics are unlocked by levelling up from completed matches. Nothing can be purchased and there are no randomised rewards.'),
+        h('p', { class: 'muted small' }, 'Every cosmetic is unlocked from the start. Nothing can be purchased and there are no randomised rewards.'),
         h('p', { class: 'muted small' }, `Created ${new Date(p.created).toLocaleDateString()} · storage: ${app.storePersistent ? 'persistent' : 'session only (browser blocked storage)'}`),
         h('div', { class: 'row', style: { marginTop: '16px' } }, h('button', { class: 'btn danger sm', onclick: () => app.confirm('Reset profile?', 'This deletes your level, statistics and cosmetics on this device.', () => app.resetProfile()) }, 'Reset profile')))));
   return { el };

@@ -221,3 +221,5 @@ table.stats tr.team-head td { font-family: var(--display); letter-spacing: 0.1em
   .scorebug .sc { font-size: 1.6em; min-width: 54px; }
   .scorebug .clock { font-size: 1.4em; min-width: 90px; }
 }
+
+.board-hint { position: absolute; top: 96px; left: 50%; transform: translateX(-50%); font-family: var(--body); font-size: 0.72em; letter-spacing: 0.12em; color: rgba(226,232,240,0.55); text-transform: uppercase; }

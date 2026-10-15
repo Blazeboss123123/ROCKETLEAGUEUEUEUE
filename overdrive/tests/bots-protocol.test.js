@@ -14,7 +14,7 @@ function botMatch(levelBlue, levelOrange, seed, duration = 120, size = 2) {
   for (let i = 0; i < size * 2; i++) { w.addCar(i + 1, i % 2); bots.push(new Bot(i + 1, i % 2 ? levelOrange : levelBlue, seed + i)); }
   w.startMatch();
   let ticks = 0, touches = 0, jumps = 0, aerials = 0;
-  while (w.match.state !== 'ended' && ticks < 120 * (duration + 60)) {
+  while (w.match.state !== 'ended' && ticks < 120 * (duration + 600)) {
     for (const b of bots) w.setInput(b.id, quantizeInput(b.think(w)));
     w.step(); ticks++;
     for (const e of w.events) { if (e.type === 'touch') touches++; if (e.type === 'jump') jumps++; }

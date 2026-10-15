@@ -1,7 +1,7 @@
 // Project Overdrive — client application: screen flow, sessions (online/offline/training),
 // main loop, presentation of simulation events, replays, progression.
 import * as THREE from 'three';
-import { TEAM_COLORS, TEAM_COLORS_ALT, MODES, ARENA_VARIANTS, PHYSICS, BALL } from '../shared/config.js';
+import { TEAM_COLORS, TEAM_COLORS_ALT, MODES, ARENA_VARIANTS, GAME_MODES, arenasForMode, PHYSICS, BALL } from '../shared/config.js';
 import { ClientSession, localPair } from '../shared/client.js';
 import { MatchHost } from '../shared/host.js';
 import { wsConnect } from '../shared/wsconn.js';
@@ -22,7 +22,7 @@ import { settingsScreen } from './ui/settings.js';
 import { garageScreen } from './ui/garage.js';
 
 setQuiet(true);
-const DEFAULT_PREFS = { casualMode: '3v3', practiceMode: '3v3', practiceBots: 'pro', practiceArena: 'stadium', practiceLength: 300, privateMode: '3v3', privateFill: 'off', privateArena: 'stadium', serverUrl: '' };
+const DEFAULT_PREFS = { casualGame: 'soccar', practiceGame: 'soccar', privateGame: 'soccar', casualMode: '3v3', practiceMode: '3v3', practiceBots: 'pro', practiceArena: 'stadium', practiceLength: 300, privateMode: '3v3', privateFill: 'off', privateArena: 'stadium', serverUrl: '' };
 const _p = new V3(), _q = new Quat();
 
 class Replay {
@@ -158,7 +158,7 @@ class App {
   applySettings(key) {
     const s = this.settings;
     saveSettings(s);
-    if (key === 'quality' || key === 'renderScale' || key === '*') this.renderer.applyQuality(s.quality);
+    if (key === 'quality' || key === 'renderScale' || key === 'postFx' || key === '*') this.renderer.applyQuality(s.quality);
     if (key.startsWith?.('vol') || key === '*') this.audio.applyVolumes();
     if (key === 'uiScale' || key === '*') document.documentElement.style.setProperty('--ui-scale', s.uiScale);
     if (key === 'colorblind' || key === '*') {
@@ -195,9 +195,9 @@ class App {
     return S;
   }
 
-  playOnline(mode) {
+  playOnline(mode, game = 'soccar') {
     if (this.net.server) {
-      const conn = wsConnect(`${this.serverWsBase()}?op=queue&mode=${mode}`);
+      const conn = wsConnect(`${this.serverWsBase()}?op=queue&mode=${mode}&game=${game}`);
       this.beginClient(conn, { online: true, via: 'server' });
       return;
     }
@@ -206,10 +206,13 @@ class App {
       this.mode = 'searching';
       this.go('searching', { mode });
       const token = (this.searchToken = {});
-      findPublicMatch(this.room, mode, (st) => { this.searchStatus = `${st.searching} player(s) searching nearby`; }).then((r) => {
+      findPublicMatch(this.room, game + ':' + mode, (st) => { this.searchStatus = `${st.searching} player(s) searching nearby`; }).then((r) => {
         if (this.searchToken !== token) return;
         if (r.join) this.joinRoom(r.join, { online: true });
-        else this.hostRoom({ mode, isPrivate: false, fill: 'pro', arena: 'stadium' });
+        else {
+          const maps = arenasForMode(game).filter((id) => ARENA_VARIANTS[id].competitive);
+          this.hostRoom({ mode, game, isPrivate: false, fill: 'pro', arena: maps[Math.floor(Math.random() * maps.length)] });
+        }
       });
       return;
     }
@@ -217,9 +220,9 @@ class App {
   }
   cancelSearch() { this.searchToken = null; this.room?.presence({ seek: null }).catch(() => {}); this.mode = 'menu'; this.go('play'); }
 
-  createPrivate({ mode, fill, arena }) {
-    if (this.net.server) { this.beginClient(wsConnect(`${this.serverWsBase()}?op=create&mode=${mode}&fill=${fill}&arena=${arena}`), { online: true, via: 'server' }); return; }
-    if (this.room) { this.hostRoom({ mode, isPrivate: true, fill, arena }); return; }
+  createPrivate({ mode, game, fill, arena }) {
+    if (this.net.server) { this.beginClient(wsConnect(`${this.serverWsBase()}?op=create&mode=${mode}&game=${game}&fill=${fill}&arena=${arena}`), { online: true, via: 'server' }); return; }
+    if (this.room) { this.hostRoom({ mode, game, isPrivate: true, fill, arena }); return; }
     toast('Private matches need the dedicated server or the shared link.', 'err');
   }
   joinPrivate(code) {
@@ -227,9 +230,9 @@ class App {
     if (this.room) { this.joinRoom(code, { online: true }); return; }
     toast('Joining needs the dedicated server or the shared link.', 'err');
   }
-  async hostRoom({ mode, isPrivate, fill, arena }) {
+  async hostRoom({ mode, game, isPrivate, fill, arena }) {
     try {
-      const rh = new RoomHost({ room: this.room, mode, isPrivate, fill, arena });
+      const rh = new RoomHost({ room: this.room, mode, game, isPrivate, fill, arena });
       await rh.open();
       const S = this.beginClient(rh.local.conn, { online: true, via: 'room-host' });
       rh.local.attach(S);
@@ -247,8 +250,8 @@ class App {
     try { await conn.open(); } catch (e) { toast('Could not reach that match.', 'err'); this.leaveSession(); }
   }
 
-  practice({ mode, difficulty, arena, duration }) {
-    const host = new MatchHost({ mode, kind: 'offline', isPrivate: true, fill: difficulty, autoStart: true, duration, arena });
+  practice({ mode, game, difficulty, arena, duration }) {
+    const host = new MatchHost({ mode, game, kind: 'offline', isPrivate: true, fill: difficulty, autoStart: true, duration, arena });
     const pair = localPair(host);
     host.out = (target, msg) => pair.deliver(target, msg);
     const S = this.beginClient(pair.conn, { online: false, via: 'offline' });
@@ -460,7 +463,7 @@ class App {
     this.viewBall.pos.set(_p.x, _p.y, _p.z);
     this.viewBall.hidden = W.ballHidden;
     this.viewBall.angVel = W.ball.angVel;
-    this.view = { cars, ball: this.viewBall, pads: W.pads };
+    this.view = { cars, ball: this.viewBall, pads: W.pads, tiles: W.tiles, drop: W.drop };
   }
 
   drawWorld(dt, now, myPid, W, ui) {
@@ -468,7 +471,7 @@ class App {
     let view = this.view;
     const rep = this.replay.playing ? this.replay.frame(now) : null;
     if (rep) {
-      view = { cars: rep.cars, ball: rep.ball, pads: W.pads };
+      view = { cars: rep.cars, ball: rep.ball, pads: W.pads, tiles: W.tiles, drop: null };
       R.rig.cinematic(dt, rep.ball.pos, s, rep.ball.pos.x > 0 ? -1 : 1);
     } else {
       const mine = view.cars.find((c) => c.id === myPid);
@@ -541,6 +544,8 @@ class App {
         case 'bump': A.play('bump', { pos: carPos(e.a), strength: e.speed }); if (e.a === myPid || e.b === myPid) R.rig?.addShake(Math.min(1, e.speed / 12), this.settings); break;
         case 'pickup': { const pad = (this.session?.world || this.training?.world).arena.pads[e.pad]; R.pickup(pad, e.large); if (e.car === myPid) A.play('pickup', { large: e.large }); break; }
         case 'boostOff': if (e.car === myPid && e.empty) A.play('boostEmpty'); break;
+        case 'tiles': R.tileBreak(e); A.play('ballWall', { pos: { x: e.x, y: 0.5, z: e.z }, strength: 10 + e.level * 6 }); break;
+        case 'charge': A.play('pickup', { large: e.level >= 3 }); break;
         case 'respawn': { const c = this.view?.cars.find((x) => x.id === e.car); const car = (this.session?.world || this.training?.world)?.car(e.car); if (car) R.respawnFx(car.pos, car.team); void c; break; }
         default: break;
       }

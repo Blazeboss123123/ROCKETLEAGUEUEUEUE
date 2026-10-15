@@ -37,11 +37,12 @@ export function integrateBall(ball, dt) {
 export function collideBallArena(ball, arena, dt) {
   const R = ball.radius;
   const p = ball.pos;
-  const s = arena.interior(p.x, p.y, p.z);
+  const s = arena.interior(p.x, p.y, p.z, true);
   ball.onSurface = false;
   if (s >= R + 0.02) return 0;
-  const n = arena.normal(p.x, p.y, p.z, _n);
+  const n = arena.normal(p.x, p.y, p.z, _n, true);
   ball.onSurface = true;
+  ball.contactNy = n.y;
   if (s < R) p.addScaled(n, R - s); // positional correction
   const vn = ball.vel.dot(n);
   if (vn >= 0) return 0;

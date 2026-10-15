@@ -4,6 +4,18 @@ An original rocket-car football game: drive, boost, jump, dodge and fly to put a
 
 Everything except the three.js renderer (MIT) was written for this project: simulation, networking, WebSocket server, bots, procedural cars/arenas, synthesised audio and UI. No third-party game assets.
 
+## Update 3: modes, maps, visuals
+
+- **Game modes**: Soccar, **Hoops** (smaller court, raised rims on the back walls, the ball has to drop through the rim) and **Dropshot** (hexagonal arena, no goals: hits charge the ball through three levels, landings on the other side crack and then open floor tiles, and a ball through a hole scores). Pick the mode in Casual, Private Match and Practice; matchmaking queues per mode.
+- **Eight arenas**: Overdrive Stadium, Solstice Park, Neon Harbor, Frostbite Peak, Dune Mirage, Skyway (casual-only), Downtown Court (Hoops) and Hexcore (Dropshot), each with its own sky, lighting, colour grade and surroundings.
+- **Goals**: the back walls now meet the floor with a tight curve, so there are no ramps beside the goal posts.
+- **Boost pads**: gradient floor decals, gradient-shaded plates and orbs, and light columns.
+- **Rendering**: HDR post-processing (bloom, filmic tone mapping, colour grading, vignette, film grain, speed fringing), arena-matched reflections on cars, contact shadows, fresnel glass walls. Toggle under Settings → Video.
+- **Camera on walls**: the camera slides along surfaces instead of snapping into the car, and its roll onto and off walls is eased.
+- **Scoreboard**: hold Tab (hint under the score). Assists now count from the scorer's touch, so passes followed by a long roller are credited; save detection tracks the ball continuously.
+- **Everything unlocked**: every cosmetic is available from the start.
+- "Competitive" was removed from the Play menu.
+
 ## Update 2: movement, demolitions, bots, cars
 
 - **Flips** now complete exactly one rotation and land wheels-down, add ~5.6 m/s, and keep you above the normal throttle top speed. Scraping the floor mid-flip no longer kills momentum. Pull the stick the opposite way to cancel a flip.
@@ -110,7 +122,7 @@ When the page runs on claude.ai, one player's browser runs the same `MatchHost` 
 Implemented and tested: dedicated server, public matchmaking (fills/backfills lobbies, starts on ready or after a timeout with bots in empty seats), private lobbies with join codes, team switching, ready-up, owner start, bot fill, reconnection, quick chat, latency display, results, rematch, return to lobby.
 
 Needs external services (interfaces are in place, not deployed):
-- **Competitive / ranked**: needs authenticated accounts and a rating service (e.g. Glicko-2 over a database). The Play menu shows it as unavailable.
+- **Ranked play**: needs authenticated accounts and a rating service (e.g. Glicko-2 over a database); not included.
 - **Multi-server matchmaking**: replace `server/matchmaking.js` with a service backed by a shared queue (e.g. Redis) that allocates dedicated server processes; clients already connect via `?op=join&code=`.
 - **Online accounts / cloud saves**: profiles are local to the browser and labelled as such.
 - **Parties across sessions**, **voice chat / push-to-talk** (needs a voice relay; the bind is listed as unavailable).
@@ -119,7 +131,7 @@ Needs external services (interfaces are in place, not deployed):
 ## Testing
 
 ```bash
-node --test tests/*.test.js     # 36 tests: physics, rules, bots, protocol, dedicated-server multiplayer, browser-host transport
+node --test tests/*.test.js     # 46 tests: physics, rules, bots, protocol, dedicated-server multiplayer, browser-host transport
 node server/server.js --port 8099 & python3 tests/ui_smoke.py http://localhost:8099/   # 21 browser UI checks (Playwright)
 ```
 

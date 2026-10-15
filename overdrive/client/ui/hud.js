@@ -14,6 +14,7 @@ export class HUD {
     this.root = h('div', { class: 'hud' });
     this.bug = h('div', { class: 'scorebug' }, this.sb = h('div', { class: 'sc b' }, '0'), this.clock = h('div', { class: 'clock' }, '5:00'), this.so = h('div', { class: 'sc o' }, '0'));
     this.pips = h('div', { class: 'pips' }, this.pipB = h('div', { class: 'side' }), this.pipO = h('div', { class: 'side' }));
+    this.hint = h('div', { class: 'board-hint' }, 'Hold TAB · Scoreboard');
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('viewBox', '0 0 170 170');
     const mk = (attrs) => { const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle'); for (const k in attrs) c.setAttribute(k, attrs[k]); svg.appendChild(c); return c; };
@@ -30,7 +31,7 @@ export class HUD {
     this.drill = h('div', { class: 'drillbox hidden' });
     this.qc = h('div', { class: 'quickchat hidden' }, QUICK_CHAT.slice(0, 9).map((t, i) => h('div', null, h('b', null, i + 1), t)), h('div', { class: 'muted small' }, 'Press a number · T to close'));
     this.board = h('div', { class: 'overlay hidden', style: { pointerEvents: 'none', background: 'rgba(3,5,10,0.35)' } });
-    this.root.append(this.bug, this.pips, this.boost, this.center, this.goal, this.net, this.feed, this.mid, this.replay, this.drill, this.qc, this.board);
+    this.root.append(this.bug, this.pips, this.hint, this.boost, this.center, this.goal, this.net, this.feed, this.mid, this.replay, this.drill, this.qc, this.board);
   }
 
   set(el, key, val, fn) { if (this.cache[key] !== val) { this.cache[key] = val; fn(val); } }
@@ -41,6 +42,8 @@ export class HUD {
     const training = st.kind === 'training';
     this.bug.classList.toggle('hidden', training);
     this.pips.classList.toggle('hidden', training);
+    const key = (app.input?.binds?.kb?.scoreboard?.[0] || 'Tab').replace(/^Key/, '').replace(/^b(\d+)$/, 'pad $1').toUpperCase();
+    this.set(this.hint, 'hint', training ? '' : `Hold ${key} · Scoreboard`, (v) => { this.hint.textContent = v; this.hint.classList.toggle('hidden', !v); });
     this.drill.classList.toggle('hidden', !training);
     if (!training) {
       this.set(this.sb, 'sb', st.score[0], (v) => { this.sb.textContent = v; });

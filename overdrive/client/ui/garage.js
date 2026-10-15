@@ -86,7 +86,7 @@ export function garageScreen(app, params = {}) {
     h('div', { class: 'topbar', style: { padding: '22px 28px 0', marginBottom: 0 } },
       h('button', { class: 'btn ghost', onclick: () => { if (dirty()) app.confirm('Discard changes?', 'You have unsaved customisation changes.', () => { app.go('main'); }); else app.go('main'); } }, '← Back'),
       h('h1', null, params.tab && params.tab !== 'body' ? 'Customise' : 'Garage'), h('div', { class: 'spacer' }),
-      h('div', { class: 'crumb' }, `Level ${prof.level} · locked items unlock as you level up`)),
+      h('div', { class: 'crumb' }, `Everything unlocked · ${Object.values(CATALOG).reduce((n, l) => n + l.length, 0)} items`)),
     h('div', { class: 'garage' }, cats, stage, items));
   return { el, leave() { app.renderer.setShowroomCar(prof.loadout, 0); } };
 }

@@ -118,9 +118,9 @@ test('room matchmaking finds an advertised public lobby', async () => {
     rh.advertise(hp);
     const seeker = hub.page();
     await sleep(200);
-    const r = await findPublicMatch(seeker, '2v2', null, 1500);
+    const r = await findPublicMatch(seeker, 'soccar:2v2', null, 1500);
     assert.equal(r.join, rh.code);
-    const none = await findPublicMatch(seeker, '1v1', null, 600);
+    const none = await findPublicMatch(seeker, 'soccar:1v1', null, 600);
     assert.equal(none.host, true, 'no lobby for that mode -> host one');
   } finally { hub.stop(); }
 });

@@ -6,8 +6,8 @@
 // No third-party dependencies.
 //
 // WebSocket URL forms (the first client message is always {t:'hello', ...}):
-//   /ws?op=queue&mode=3v3                  public matchmaking
-//   /ws?op=create&mode=2v2&fill=off|pro..  create a private match (join code returned in welcome)
+//   /ws?op=queue&mode=3v3&game=hoops       public matchmaking (game: soccar | hoops | dropshot)
+//   /ws?op=create&mode=2v2&game=..&arena=..&fill=off|pro..  create a private match (join code returned in welcome)
 //   /ws?op=join&code=ABC234                join a private match, or reconnect (token in hello)
 
 import http from 'node:http';
@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { attachWebSocket } from './ws.js';
 import { MatchHost } from '../shared/host.js';
-import { PHYSICS, NET, MODES } from '../shared/config.js';
+import { PHYSICS, NET, MODES, GAME_MODES, ARENA_VARIANTS, arenasForMode } from '../shared/config.js';
 import { validateClientMsg, CODE_RE, makeCode } from '../shared/protocol.js';
 import { setLogSink, log } from '../shared/log.js';
 import { Matchmaker } from './matchmaking.js';
@@ -50,24 +50,32 @@ export function startServer(opts = {}) {
   setLogSink((e) => { if (!cfg.quiet) process.stdout.write(JSON.stringify(e) + '\n'); });
 
   // ------------------------------------------------------------- sessions
-  function createSession({ mode, isPrivate, fill, arena }) {
+  function createSession({ mode, game, isPrivate, fill, arena }) {
     let code;
     do code = makeCode(); while (sessions.has(code));
     const rec = { code, conns: new Map(), joining: null, host: null, created: Date.now() };
     rec.host = new MatchHost({
-      mode, isPrivate, fill, arena, code, kind: 'dedicated', snapshotRate: cfg.snapshotRate, lobbyTimeout: cfg.lobbyTimeout,
+      mode, game, isPrivate, fill, arena, code, kind: 'dedicated', snapshotRate: cfg.snapshotRate, lobbyTimeout: cfg.lobbyTimeout,
       out: (target, msg) => route(rec, target, msg),
       onEmpty: () => { sessions.delete(code); for (const c of rec.conns.values()) c.ws.close(1000, 'session closed'); },
     });
     sessions.set(code, rec);
-    log('server', 'session created', { code, mode, isPrivate });
+    log('server', 'session created', { code, mode, game: rec.host.game, arena: rec.host.arena, isPrivate });
     return rec;
   }
 
+  // queue key: "<game>:<size>", e.g. "hoops:2v2"
   const matchmaker = new Matchmaker({
-    findOpen: (mode) => [...sessions.values()].find((s) => !s.host.isPrivate && s.host.mode === mode && s.host.phase !== 'closed' && s.host.phase !== 'results' &&
-      (s.host.phase === 'lobby' ? s.host.humans().length < s.host.capacity() : [...s.host.players.values()].some((p) => p.bot))),
-    create: (mode) => createSession({ mode, isPrivate: false, fill: 'pro', arena: Math.random() < 0.5 ? 'stadium' : 'solstice' }),
+    findOpen: (key) => {
+      const [game, mode] = key.split(':');
+      return [...sessions.values()].find((s) => !s.host.isPrivate && s.host.mode === mode && s.host.game === game && s.host.phase !== 'closed' && s.host.phase !== 'results' &&
+        (s.host.phase === 'lobby' ? s.host.humans().length < s.host.capacity() : [...s.host.players.values()].some((p) => p.bot)));
+    },
+    create: (key) => {
+      const [game, mode] = key.split(':');
+      const maps = arenasForMode(game).filter((id) => ARENA_VARIANTS[id].competitive);
+      return createSession({ mode, game, isPrivate: false, fill: 'pro', arena: maps[Math.floor(Math.random() * maps.length)] });
+    },
   });
 
   function route(rec, target, msg) {
@@ -143,6 +151,7 @@ export function startServer(opts = {}) {
 
   function joinFor(c, hello) {
     const op = c.op, mode = MODES[c.url.searchParams.get('mode')] ? c.url.searchParams.get('mode') : '3v3';
+    const game = GAME_MODES[c.url.searchParams.get('game')] ? c.url.searchParams.get('game') : 'soccar';
     let rec;
     if (op === 'join') {
       const code = (c.url.searchParams.get('code') || '').toUpperCase();
@@ -150,10 +159,10 @@ export function startServer(opts = {}) {
       rec = sessions.get(code);
     } else if (op === 'create') {
       const fill = c.url.searchParams.get('fill');
-      rec = createSession({ mode, isPrivate: true, fill: ['off', 'rookie', 'pro', 'elite'].includes(fill) ? fill : 'off', arena: c.url.searchParams.get('arena') || 'stadium' });
+      rec = createSession({ mode, game, isPrivate: true, fill: ['off', 'rookie', 'pro', 'elite'].includes(fill) ? fill : 'off', arena: c.url.searchParams.get('arena') || '' });
     } else if (op === 'queue') {
-      c.ws.send(JSON.stringify({ t: 'queue', status: 'searching', mode }));
-      rec = matchmaker.place(c, mode);
+      c.ws.send(JSON.stringify({ t: 'queue', status: 'searching', mode, game }));
+      rec = matchmaker.place(c, game + ':' + mode);
     } else return reject(c, 'bad_op', 'Unknown operation.');
     rec.joining = c;
     const res = rec.host.join(hello.name, hello.cos, hello.token);
@@ -172,7 +181,7 @@ export function startServer(opts = {}) {
           ok: true, sessions: sessions.size, players: [...sessions.values()].reduce((a, s) => a + s.host.connectedHumans().length, 0),
           tickRate: PHYSICS.tickRate, snapshotRate: cfg.snapshotRate, avgTickMs: stats.ticks ? +(stats.tickMs / stats.ticks).toFixed(3) : 0,
           maxTickMs: +stats.maxTickMs.toFixed(3), lag: cfg.lag, jitter: cfg.jitter, loss: cfg.loss,
-          list: [...sessions.values()].map((s) => ({ code: s.host.isPrivate ? 'private' : s.code, mode: s.host.mode, phase: s.host.phase, humans: s.host.connectedHumans().length })),
+          list: [...sessions.values()].map((s) => ({ code: s.host.isPrivate ? 'private' : s.code, mode: s.host.mode, game: s.host.game, arena: s.host.arena, phase: s.host.phase, humans: s.host.connectedHumans().length })),
         };
         res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
         return res.end(JSON.stringify(body));

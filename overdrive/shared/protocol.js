@@ -14,7 +14,7 @@
 //   {t:'end', mid, score, winner, stats}   {t:'pong', c, s}   {t:'chat', pid, q}
 //   {t:'closed', reason}   {t:'error', code, msg}
 
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 export const QUICK_CHAT = [
   'Nice shot!', 'Great pass!', 'What a save!', 'I got it!', 'Need boost!', 'Take the shot!',

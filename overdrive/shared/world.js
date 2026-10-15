@@ -2,7 +2,7 @@
 // Runs identically on the dedicated server, on a browser host, in offline matches and in
 // client-side prediction. One call to step() advances exactly one fixed tick.
 
-import { PHYSICS, MATCH, BALL, CAR } from './config.js';
+import { PHYSICS, MATCH, BALL, CAR, DROPSHOT } from './config.js';
 const _demoHits = [];
 import { V3, Quat, rng, round } from './math.js';
 import { Arena } from './arena.js';
@@ -40,6 +40,11 @@ export class World {
       score: [0, 0], kickoffs: 0, goalSeq: 0, lastGoal: null, waitingGround: false,
     };
     this.ballHidden = false;
+    this.mode = this.arena.mode;
+    // Dropshot: breakable floor and ball charge
+    this.tiles = this.mode === 'dropshot' ? new Uint8Array(this.arena.tiles.length) : null;
+    this.arena.tileState = this.tiles;
+    this.drop = { charge: 0, level: 1, active: false, team: -1, seq: 0 };
     this.demoSeq = 0; this.lastDemo = null;
     this.lastTouch = null;   // {id, team, tick}
     this.touchHistory = [];  // recent touches for assists
@@ -92,9 +97,11 @@ export class World {
         c.frozen = true;
       });
     }
-    this.ball.reset();
+    this.ball.reset(this.arena.kickoffBallY(this.ball.radius));
     this.ballHidden = false;
     this.pads.fill(0);
+    if (this.tiles) this.tiles.fill(0);
+    this.drop.charge = 0; this.drop.level = 1; this.drop.active = false; this.drop.team = -1;
     this.lastTouch = null; this.touchHistory = []; this.pendingEval = null; this.shotBy = -1;
     m.state = 'countdown';
     m.timer = MATCH.countdown;
@@ -146,6 +153,7 @@ export class World {
       const inp = this.inputs.get(car.id) || neutralInput();
       stepCarControls(car, inp, this.arena, dt, this.emitEvents ? this.events : null);
       if (this.unlimitedBoost) car.boost = 100;
+      else if (this.mode === 'dropshot' && !car.frozen) car.boost = Math.min(100, car.boost + DROPSHOT.boostRegen * dt);
       integrateCar(car, dt);
     }
     // ---- ball ----
@@ -174,6 +182,7 @@ export class World {
     if (ballActive) {
       const bimp = collideBallArena(ball, this.arena, dt);
       if (bimp > 3) this.event({ type: 'ballWall', speed: bimp, x: ball.pos.x, y: ball.pos.y, z: ball.pos.z });
+      if (this.tiles && ball.onSurface && ball.contactNy > 0.8 && ball.pos.y < ball.radius + 0.3) this.dropshotFloorHit();
       // alternate the resolution order every tick so simultaneous challenges are fair to both teams
       const n = this.cars.length, rev = this.tick & 1;
       for (let k = 0; k < n; k++) {
@@ -200,10 +209,11 @@ export class World {
           else { m.overtime = true; m.clock = 0; m.waitingGround = false; this.event({ type: 'overtime' }); this.kickoff(); }
         }
       }
-      // ball threat tracking for save detection (cheap, a few times per second)
-      if (ballActive && --this.headingTimer <= 0) {
-        this.headingTimer = 12;
-        this.heading = ballHeading(ball, this.arena, 2.0);
+      // ball threat tracking for save detection: where the ball is really going (wall bounces and
+      // long rollers included) just before a defender touches it
+      if (ballActive && !this.pendingEval && --this.headingTimer <= 0) {
+        this.headingTimer = 6;
+        this.heading = ballHeading(ball, this.arena, 3.5);
       }
     }
   }
@@ -279,7 +289,30 @@ export class World {
     }
   }
 
+  // Dropshot: a ball hit by a team damages the other team's floor when it lands there.
+  dropshotFloorHit() {
+    const d = this.drop, b = this.ball;
+    if (!d.active) return;
+    const side = b.pos.z < 0 ? 0 : 1;
+    if (side === d.team) return;
+    const i = this.arena.tileAt(b.pos.x, b.pos.z);
+    if (i < 0) return;
+    for (const j of this.arena.tilesWithin(i, d.level - 1)) this.tiles[j] = Math.min(2, this.tiles[j] + 1);
+    this.event({ type: 'tiles', x: b.pos.x, z: b.pos.z, level: d.level, team: side });
+    d.seq++;
+    d.active = false; d.charge = 0; d.level = 1;
+  }
+
   onTouch(car, deltaSpeed) {
+    if (this.tiles) {
+      const d = this.drop;
+      if (d.team !== car.team) { d.charge = Math.max(0, d.charge * 0.5); }
+      d.active = true; d.team = car.team;
+      d.charge += deltaSpeed;
+      const lv = d.charge >= DROPSHOT.chargeLevel3 ? 3 : d.charge >= DROPSHOT.chargeLevel2 ? 2 : 1;
+      if (lv > d.level) this.event({ type: 'charge', level: lv });
+      d.level = Math.max(d.level, lv);
+    }
     const t = { id: car.id, team: car.team, tick: this.tick };
     const prev = this.lastTouch;
     this.lastTouch = t;
@@ -309,7 +342,7 @@ export class World {
   checkGoal() {
     const m = this.match;
     if (m.state !== 'live' && m.state !== 'free') return;
-    const conceded = this.arena.goalConceded(this.ball.pos, this.ball.radius);
+    const conceded = this.arena.goalConceded(this.ball.pos, this.ball.radius, this.ball.vel);
     if (conceded < 0) return;
     const team = 1 - conceded;
     const speed = this.ball.vel.len();
@@ -328,9 +361,13 @@ export class World {
       const st = this.stats.get(scorer);
       if (st) { st.goals++; st.score += 100; if (this.shotBy !== scorer) { st.shots++; st.score += 20; } }
       this.shotBy = -1;
-      for (let i = this.touchHistory.length - 1; i >= 0; i--) {
+      // assist: the last teammate touch within the window before the scorer's first touch of this
+      // possession (measured from that touch, not from the goal, so long rollers still count)
+      let ref = this.tick, i = this.touchHistory.length - 1;
+      while (i >= 0 && this.touchHistory[i].id === scorer) { ref = this.touchHistory[i].tick; i--; }
+      for (; i >= 0; i--) {
         const h = this.touchHistory[i];
-        if ((this.tick - h.tick) * this.dt > MATCH.assistWindow) break;
+        if ((ref - h.tick) * this.dt > MATCH.assistWindow) break;
         if (h.id !== scorer && h.team === team) {
           assist = h.id; const sa = this.stats.get(assist); if (sa) { sa.assists++; sa.score += 50; }
           break;
@@ -381,6 +418,7 @@ export class World {
     }
     const m = this.match;
     m.timer = round(m.timer, 1000); m.clock = round(m.clock, 1000);
+    this.drop.charge = round(this.drop.charge, 100);
     for (let i = 0; i < this.pads.length; i++) this.pads[i] = round(this.pads[i], 100);
   }
 
@@ -390,7 +428,8 @@ export class World {
     const match = [SC[m.state], m.timer, m.clock, m.overtime ? 1 : 0, m.score[0], m.score[1], m.kickoffs, m.goalSeq,
       lg ? lg.team : -1, lg ? lg.scorer : -1, lg ? lg.assist : -1, lg ? lg.speed : 0, m.waitingGround ? 1 : 0, this.ballHidden ? 1 : 0,
       this.lastTouch ? this.lastTouch.id : -1, this.lastTouch ? this.tick - this.lastTouch.tick : 0,
-      this.demoSeq, this.lastDemo ? this.lastDemo.victim : -1, this.lastDemo ? this.lastDemo.attacker : -1];
+      this.demoSeq, this.lastDemo ? this.lastDemo.victim : -1, this.lastDemo ? this.lastDemo.attacker : -1,
+      this.drop.charge, this.drop.level, this.drop.active ? 1 : 0, this.drop.team, this.drop.seq];
     const ball = [b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.angVel.x, b.angVel.y, b.angVel.z];
     const cars = this.cars.map((c) => {
       const flags = (c.onGround ? 1 : 0) | (c.jumped ? 2 : 0) | (c.jumping ? 4 : 0) | (c.doubleJumped ? 8 : 0) |
@@ -402,11 +441,11 @@ export class World {
     });
     const pads = [];
     for (let i = 0; i < this.pads.length; i++) if (this.pads[i] > 0) pads.push(i, this.pads[i]);
-    return [this.tick, match, ball, cars, pads];
+    return [this.tick, match, ball, cars, pads, this.tiles ? this.tiles.join('') : 0];
   }
 
   applySnapshot(s) {
-    const [tick, match, ball, cars, pads] = s;
+    const [tick, match, ball, cars, pads, tiles] = s;
     this.tick = tick;
     const m = this.match;
     m.state = STATES[match[0]] || 'waiting'; m.timer = match[1]; m.clock = match[2]; m.overtime = !!match[3];
@@ -415,6 +454,8 @@ export class World {
     m.waitingGround = !!match[12]; this.ballHidden = !!match[13];
     this.lastTouch = match[14] >= 0 ? { id: match[14], team: -1, tick: tick - match[15] } : null;
     this.demoSeq = match[16] || 0; this.lastDemo = match[17] >= 0 ? { victim: match[17], attacker: match[18] } : null;
+    if (match.length > 19) { const d = this.drop; d.charge = match[19]; d.level = match[20]; d.active = !!match[21]; d.team = match[22]; d.seq = match[23]; }
+    if (this.tiles && typeof tiles === 'string' && tiles.length === this.tiles.length) for (let i = 0; i < tiles.length; i++) this.tiles[i] = tiles.charCodeAt(i) - 48;
     const b = this.ball;
     b.pos.set(ball[0], ball[1], ball[2]); b.vel.set(ball[3], ball[4], ball[5]); b.angVel.set(ball[6], ball[7], ball[8]);
     const seen = new Set();

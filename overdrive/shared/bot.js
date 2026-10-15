@@ -94,7 +94,7 @@ export class Bot {
   decide(world, car) {
     const ball = world.ball, arena = world.arena;
     const team = car.team, dir = team === 0 ? 1 : -1; // attacking direction along z
-    const ownGoalZ = team === 0 ? -arena.halfL : arena.halfL;
+    const ownGoalZ = arena.goalCenter(team, _tmp).z;
     const pred = prediction(world);
     if (world.ballHidden) return { kind: 'position', x: 0, z: ownGoalZ * 0.5, speed: 0.6 };
 
@@ -152,19 +152,19 @@ export class Bot {
   }
 
   threatened(pred, arena, team) {
+    const p = _aim, v = _tgt;
     for (let i = 0; i < pred.length; i += 2) {
       const s = pred[i];
-      if (Math.abs(s.x) < arena.goalHalfW + 1 && s.y < arena.p.goalHeight + 0.5) {
-        if (team === 0 ? s.z < -arena.halfL + 1 : s.z > arena.halfL - 1) return true;
-      }
+      p.set(s.x, s.y, s.z); v.set(s.vx, s.vy, s.vz);
+      if (arena.goalConceded(p, 0.95, v) === team) return true;
     }
     return false;
   }
 
   intercept(world, car, pred, dir, threat) {
     const arena = world.arena;
-    const oppGoalZ = dir * (arena.halfL + 3);
-    const ownGoalZ = -dir * arena.halfL;
+    const oppGoalZ = arena.mode === 'soccar' ? dir * (arena.halfL + 3) : arena.goalCenter(car.team === 0 ? 1 : 0, _tmp).z;
+    const ownGoalZ = arena.mode === 'soccar' ? -dir * arena.halfL : arena.goalCenter(car.team, _tmp).z;
     const avgSpeed = (car.boost > 15 && this.cfg.boostUse > 0.3 ? 17 : 12) * this.cfg.speedFactor;
     for (let i = 0; i < pred.length; i++) {
       const s = pred[i];

@@ -23,7 +23,10 @@ export const ARENA = {
   length: 96,             // goal line to goal line (m)
   width: 70,              // side wall to side wall (m)
   height: 22,             // floor to ceiling (m)
-  wallCurve: 4.5,         // radius of floor/wall/ceiling transitions (m)
+  mode: 'soccar',         // soccar | hoops | dropshot
+  plan: 'rect',           // rect | hex (plan-view outline)
+  wallCurve: 4.5,         // radius of floor/wall/ceiling transitions on the side walls (m)
+  endCurve: 2.5,          // tighter transition on the back walls: no big ramps beside the goals (m)
   cornerRadius: 15,       // radius of the vertical corner fillets in plan view (m)
   goalWidth: 18,          // goal mouth width (m)
   goalHeight: 6.6,        // goal mouth height (m)
@@ -133,10 +136,42 @@ export const BALL = {
 };
 
 // Arena layouts. Competitive arenas share identical geometry; 'skyway' is a casual-only variant.
+// Game modes. Every arena belongs to exactly one mode.
+export const GAME_MODES = {
+  soccar: { name: 'Soccar', blurb: 'Classic rocket-car football: get the ball in the net.' },
+  hoops: { name: 'Hoops', blurb: 'Smaller court with raised hoops: the ball has to drop through the rim.' },
+  dropshot: { name: 'Dropshot', blurb: 'No goals. Charge the ball with big hits, smash the floor tiles on their side, and drop it through a hole.' },
+};
+
+// Arena layouts. Soccar arenas share identical competitive geometry; 'skyway' is a casual-only variant.
 export const ARENA_VARIANTS = {
-  stadium: { name: 'Overdrive Stadium', competitive: true, params: {} },
-  solstice: { name: 'Solstice Park', competitive: true, params: {} },
-  skyway: { name: 'Skyway (Experimental)', competitive: false, params: { width: 80, height: 30, cornerRadius: 22, wallCurve: 6 } },
+  stadium: { name: 'Overdrive Stadium', mode: 'soccar', competitive: true, params: {} },
+  solstice: { name: 'Solstice Park', mode: 'soccar', competitive: true, params: {} },
+  harbor: { name: 'Neon Harbor', mode: 'soccar', competitive: true, params: {} },
+  frostbite: { name: 'Frostbite Peak', mode: 'soccar', competitive: true, params: {} },
+  mirage: { name: 'Dune Mirage', mode: 'soccar', competitive: true, params: {} },
+  skyway: { name: 'Skyway (Experimental)', mode: 'soccar', competitive: false, params: { width: 80, height: 30, cornerRadius: 22, wallCurve: 6, endCurve: 2.8 } },
+  court: { name: 'Downtown Court', mode: 'hoops', competitive: true, params: { mode: 'hoops', length: 74, width: 58, height: 18, wallCurve: 3.2, endCurve: 2.0, cornerRadius: 10 } },
+  hexcore: { name: 'Hexcore', mode: 'dropshot', competitive: true, params: { mode: 'dropshot', plan: 'hex', length: 96, width: 84, height: 24, wallCurve: 4, endCurve: 4, cornerRadius: 6 } },
+};
+export function arenasForMode(mode) { return Object.entries(ARENA_VARIANTS).filter(([, v]) => v.mode === mode).map(([k]) => k); }
+
+export const HOOPS = {
+  rimHeight: 4.6,        // height of the rim above the floor (m)
+  rimRadius: 2.9,        // inner ring radius (m)
+  rimTube: 0.14,         // rim thickness (m)
+  wallGap: 0.35,         // gap between the back wall and the rim (m)
+  netDepth: 2.6,         // how far below the rim the net reaches (m)
+  kickoffBallHeight: 7,  // ball drops in from here at kickoff (m)
+};
+
+export const DROPSHOT = {
+  tileRadius: 3.6,       // hexagon tile circumradius (m)
+  chargeLevel2: 16,      // accumulated hit strength for a charged ball (m/s)
+  chargeLevel3: 36,      // ... and for a super-charged ball
+  boostRegen: 10,        // boost units per second (no pads in Dropshot)
+  kickoffBallHeight: 6,
+  holeDepth: 8,          // how far below the floor a hole goes before it counts (m)
 };
 
 export const BOOST_PADS = {

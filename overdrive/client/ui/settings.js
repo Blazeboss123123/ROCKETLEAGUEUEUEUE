@@ -26,6 +26,8 @@ export function settingsScreen(app, params = {}) {
     video: () => [
       row('Display mode', 'Fullscreen uses the browser fullscreen API', choice('displayMode', [['windowed', 'Windowed'], ['fullscreen', 'Fullscreen']])),
       row('Graphics quality', 'Shadows, particle density, pixel ratio, crowd detail', choice('quality', [['low', 'Low'], ['medium', 'Medium'], ['high', 'High']])),
+      row('Post-processing', 'Bloom, filmic tone mapping, colour grading, vignette and film grain', tog('postFx')),
+      row('Speed effects', 'Subtle edge fringing at supersonic speed', tog('speedFx')),
       row('Resolution scale', 'Internal render resolution relative to the window', slider('renderScale', 0.5, 1.5, 0.05, (v) => Math.round(v * 100) + '%')),
       row('Frame-rate limit', '0 = match the display refresh', slider('fpsLimit', 0, 240, 30, (v) => (v ? v + ' fps' : 'Display'))),
       row('V-sync', 'Browsers always present frames on the display refresh; this cannot be disabled from a web page', h('span', { class: 'muted small' }, 'Always on (browser-controlled)')),

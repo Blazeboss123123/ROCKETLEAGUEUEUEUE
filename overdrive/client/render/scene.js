@@ -4,7 +4,59 @@ import { buildArena, ARENA_THEMES } from './arenaMesh.js';
 import { buildCar, disposeObject, glowTexture } from './carMesh.js';
 import { Particles, Rings, goalExplosion } from './effects.js';
 import { CameraRig } from '../camera.js';
+import { PostFX } from './post.js';
 import { BALL } from '../../shared/config.js';
+
+let _blobGeo = null, _blobTex = null;
+// soft dark ellipse under each car (contact shadow / ambient occlusion)
+function blobTexture() {
+  if (_blobTex) return _blobTex;
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const g = c.getContext('2d');
+  const rg = g.createRadialGradient(64, 64, 4, 64, 64, 64);
+  rg.addColorStop(0, 'rgba(0,0,0,0.85)'); rg.addColorStop(0.55, 'rgba(0,0,0,0.45)'); rg.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = rg; g.fillRect(0, 0, 128, 128);
+  _blobTex = new THREE.CanvasTexture(c);
+  return _blobTex;
+}
+
+const PAD_PARTS = ['sDecal', 'lDecal', 'sBase', 'lBase', 'sOrb', 'lOrb', 'sBeam', 'lBeam', 'lRing'];
+
+// Vertex-colour gradient along an axis (top colour -> bottom colour).
+function gradientGeo(geo, top, bottom, axis = 'y') {
+  geo.computeBoundingBox();
+  const bb = geo.boundingBox, lo = bb.min[axis], hi = bb.max[axis];
+  const p = geo.attributes.position, cols = new Float32Array(p.count * 3);
+  const a = new THREE.Color(top), b = new THREE.Color(bottom), c = new THREE.Color();
+  const ax = axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
+  for (let i = 0; i < p.count; i++) {
+    const k = hi > lo ? (p.getComponent(i, ax) - lo) / (hi - lo) : 1;
+    c.copy(b).lerp(a, k); cols[i * 3] = c.r; cols[i * 3 + 1] = c.g; cols[i * 3 + 2] = c.b;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+  return geo;
+}
+
+function padTextures() {
+  const decal = (S, ticks) => {
+    const c = document.createElement('canvas'); c.width = c.height = S;
+    const g = c.getContext('2d'), m = S / 2;
+    const rg = g.createRadialGradient(m, m, 0, m, m, m);
+    rg.addColorStop(0, 'rgba(255,248,214,0.95)'); rg.addColorStop(0.22, 'rgba(255,214,102,0.9)'); rg.addColorStop(0.5, 'rgba(255,146,30,0.6)');
+    rg.addColorStop(0.74, 'rgba(255,84,0,0.16)'); rg.addColorStop(0.84, 'rgba(255,196,84,0.95)'); rg.addColorStop(0.9, 'rgba(255,120,20,0.45)'); rg.addColorStop(1, 'rgba(255,90,0,0)');
+    g.fillStyle = rg; g.fillRect(0, 0, S, S);
+    g.strokeStyle = 'rgba(255,240,190,0.8)'; g.lineWidth = S / 64;
+    for (let i = 0; i < ticks; i++) { const a = (i / ticks) * Math.PI * 2; g.beginPath(); g.moveTo(m + Math.cos(a) * m * 0.58, m + Math.sin(a) * m * 0.58); g.lineTo(m + Math.cos(a) * m * 0.7, m + Math.sin(a) * m * 0.7); g.stroke(); }
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+  };
+  const bc = document.createElement('canvas'); bc.width = 8; bc.height = 256;
+  const bg = bc.getContext('2d');
+  const lg = bg.createLinearGradient(0, 0, 0, 256);
+  lg.addColorStop(0, 'rgba(255,120,20,0)'); lg.addColorStop(0.45, 'rgba(255,140,30,0.18)'); lg.addColorStop(0.85, 'rgba(255,196,80,0.55)'); lg.addColorStop(1, 'rgba(255,240,180,0.9)');
+  bg.fillStyle = lg; bg.fillRect(0, 0, 8, 256);
+  const beam = new THREE.CanvasTexture(bc); beam.colorSpace = THREE.SRGBColorSpace;
+  return { decalSmall: decal(128, 6), decalLarge: decal(256, 12), beam };
+}
 
 const _p = new THREE.Vector3(), _q = new THREE.Quaternion(), _v = new THREE.Vector3(), _a = new THREE.Vector3(), _q2 = new THREE.Quaternion();
 
@@ -101,6 +153,7 @@ export class GameRenderer {
     this.arenaObj = null;
     this.rig = null;
     this.time = 0;
+    this.post = new PostFX(this.renderer);
     this.envMap = makeEnvironment(this.renderer);
     this.scene.environment = this.envMap;
     this.initShowroom();
@@ -168,7 +221,34 @@ export class GameRenderer {
     }
     sr.ring.material.color.setHSL(0.53 + Math.sin(sr.t * 0.5) * 0.03, 1, 0.68);
     sr.fx.update(dt); sr.rings.update(dt);
-    this.renderer.render(sr.scene, cam);
+    this.renderView(sr.scene, cam, dt, { bloom: 0.5, threshold: 1.5, exposure: 0.85, vignette: 0.5 });
+  }
+
+  usePost() { return this.settings.postFx !== false && this.settings.quality !== 'low'; }
+  renderView(scene, camera, dt, look) {
+    if (this.usePost()) this.post.render(scene, camera, dt, look);
+    else this.renderer.render(scene, camera);
+  }
+
+  // Reflections that match the arena: capture the built arena into a prefiltered environment map
+  // (from a point above the centre spot) and use it for every PBR material in the scene.
+  captureEnvironment() {
+    if (this.arenaEnv) { this.arenaEnv.dispose(); this.arenaEnv = null; }
+    const g = this.arenaObj.group;
+    const pads = this.padField ? PAD_PARTS.map((k) => this.padField[k]) : [];
+    for (const m of pads) m.visible = false;
+    const hidden = [this.ball, this.ballShadow, this.ballOutline].filter((o) => o.visible);
+    for (const o of hidden) o.visible = false;
+    g.position.y -= 7; g.updateMatrixWorld(true);
+    const pm = new THREE.PMREMGenerator(this.renderer);
+    try { this.arenaEnv = pm.fromScene(this.scene, 0.015, 0.1, 1200); } catch { this.arenaEnv = null; }
+    pm.dispose();
+    g.position.y += 7; g.updateMatrixWorld(true);
+    for (const m of pads) m.visible = true;
+    for (const o of hidden) o.visible = true;
+    // ambient image lighting stays on the bright studio map; the arena capture is used as the
+    // reflection source for car paint, glass and rims (see syncCars)
+    this.scene.environment = this.envMap;
   }
 
   applyQuality(q) {
@@ -197,36 +277,45 @@ export class GameRenderer {
     this.arenaObj = buildArena(arena, themeId, colors, this.settings.quality);
     this.scene.add(this.arenaObj.group);
     const th = this.arenaObj.theme;
-    this.scene.background = new THREE.Color(th.sky);
-    this.scene.fog = new THREE.Fog(th.fog, 120, 340);
+    this.scene.background = new THREE.Color(th.sky.horizon);
+    this.scene.fog = new THREE.Fog(th.fog, ...(th.fogRange || [140, 520]));
     this.buildPads(arena.pads);
+    this.captureEnvironment();
     this.rig = new CameraRig(this.camera, arena);
     this.clearCars();
   }
 
-  // Boost pads as instanced meshes (a few draw calls for all pads).
+  // Boost pads as instanced meshes (a few draw calls for all pads). Gradient decals on the
+  // floor, gradient-shaded plates and orbs, and a fading light column over every pad.
   buildPads(pads) {
-    const mk = (geo, mat, list) => { const m = new THREE.InstancedMesh(geo, mat, Math.max(1, list.length)); m.count = list.length; m.instanceMatrix.setUsage(THREE.DynamicDrawUsage); this.scene.add(m); return m; };
+    const mk = (geo, mat, list, order = 0) => { const m = new THREE.InstancedMesh(geo, mat, Math.max(1, list.length)); m.count = list.length; m.instanceMatrix.setUsage(THREE.DynamicDrawUsage); m.frustumCulled = false; m.renderOrder = order; this.scene.add(m); return m; };
     const small = pads.filter((p) => !p.large), large = pads.filter((p) => p.large);
-    const baseMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6 });
-    const orbMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-    const haloMat = new THREE.MeshBasicMaterial({ map: glowTexture(), color: 0xffffff, transparent: true, opacity: 0.6, blending: THREE.AdditiveBlending, depthWrite: false });
+    const T = padTextures();
+    const plateMat = new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.35, metalness: 0.55 });
+    const orbMat = new THREE.MeshBasicMaterial({ color: 0xffffff, vertexColors: true });
+    const decalMat = (map) => new THREE.MeshBasicMaterial({ map, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2 });
+    const beamMat = new THREE.MeshBasicMaterial({ map: T.beam, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0xffffff, vertexColors: true });
     const P = {
-      pads, small, large,
-      sBase: mk(new THREE.CylinderGeometry(0.55, 0.65, 0.08, 20), baseMat, small), lBase: mk(new THREE.CylinderGeometry(1.0, 1.15, 0.08, 24), baseMat, large),
-      sOrb: mk(new THREE.SphereGeometry(0.18, 12, 8), orbMat, small), lOrb: mk(new THREE.SphereGeometry(0.5, 16, 12), orbMat, large),
-      sHalo: mk(new THREE.PlaneGeometry(1.3, 1.3).rotateX(-Math.PI / 2), haloMat, small), lHalo: mk(new THREE.PlaneGeometry(3.2, 3.2).rotateX(-Math.PI / 2), haloMat, large),
-      lRing: mk(new THREE.TorusGeometry(0.85, 0.05, 8, 32).rotateX(Math.PI / 2), orbMat, large),
+      pads, small, large, T,
+      sDecal: mk(new THREE.PlaneGeometry(1.9, 1.9).rotateX(-Math.PI / 2), decalMat(T.decalSmall), small, 1),
+      lDecal: mk(new THREE.PlaneGeometry(4.2, 4.2).rotateX(-Math.PI / 2), decalMat(T.decalLarge), large, 1),
+      sBase: mk(gradientGeo(new THREE.CylinderGeometry(0.5, 0.62, 0.1, 6), 0xfff2c4, 0x7a3a06), plateMat, small),
+      lBase: mk(gradientGeo(new THREE.CylinderGeometry(1.0, 1.18, 0.14, 32), 0xfff2c4, 0x7a3a06), plateMat, large),
+      sOrb: mk(gradientGeo(new THREE.OctahedronGeometry(0.2, 1), 0xfffbe6, 0xff7a00), orbMat, small),
+      lOrb: mk(gradientGeo(new THREE.IcosahedronGeometry(0.5, 2), 0xfffbe6, 0xff6a00), orbMat, large),
+      sBeam: mk(new THREE.CylinderGeometry(0.42, 0.5, 0.9, 20, 1, true).translate(0, 0.45, 0), beamMat, small, 3),
+      lBeam: mk(new THREE.CylinderGeometry(0.95, 1.05, 3.4, 32, 1, true).translate(0, 1.7, 0), beamMat, large, 3),
+      lRing: mk(gradientGeo(new THREE.TorusGeometry(0.85, 0.05, 8, 40).rotateX(Math.PI / 2), 0xffe08a, 0xff5a00, 'x'), ringMat, large),
       m: new THREE.Matrix4(), q: new THREE.Quaternion(), v: new THREE.Vector3(), s: new THREE.Vector3(), c: new THREE.Color(),
     };
-    for (const k of ['sBase', 'lBase', 'sOrb', 'lOrb', 'sHalo', 'lHalo', 'lRing']) P[k].frustumCulled = false;
-    P.sHalo.renderOrder = 1; P.lHalo.renderOrder = 1;
     this.padField = P;
     this.updatePads(null, 0);
   }
   disposePads() {
     const P = this.padField; if (!P) return;
-    for (const k of ['sBase', 'lBase', 'sOrb', 'lOrb', 'sHalo', 'lHalo', 'lRing']) { this.scene.remove(P[k]); P[k].geometry.dispose(); }
+    for (const k of PAD_PARTS) { this.scene.remove(P[k]); P[k].geometry.dispose(); }
+    for (const t of Object.values(P.T)) t.dispose();
     this.padField = null;
   }
   updatePads(timers, t) {
@@ -237,18 +326,19 @@ export class GameRenderer {
       m.compose(v.set(x, y, z), q, s.set(sc, sc, sc)); mesh.setMatrixAt(i, m);
       if (color !== undefined) mesh.setColorAt(i, c.set(color));
     };
-    const each = (list, base, orb, halo, ring, large) => list.forEach((p, i) => {
+    const each = (list, large) => list.forEach((p, i) => {
       const idx = P.pads.indexOf(p);
       const on = !(timers && timers[idx] > 0);
-      const col = large ? 0xffb020 : 0xffd27a;
-      put(base, i, p.x, 0.05, p.z, 1, on ? col : 0x3a3f4b);
-      put(orb, i, p.x, (large ? 1.0 : 0.35) + Math.sin(t * 2 + idx) * 0.06, p.z, on ? 1 : 0, col);
-      put(halo, i, p.x, 0.1, p.z, 1, on ? new THREE.Color(col).multiplyScalar(0.8 + Math.sin(t * 3 + idx) * 0.2) : 0x080808);
-      if (ring) put(ring, i, p.x, 1.0, p.z, on ? 1 : 0, col, t + idx);
+      const pulse = 0.85 + Math.sin(t * 3 + idx) * 0.15;
+      put(large ? P.lDecal : P.sDecal, i, p.x, 0.02, p.z, 1, on ? c.setScalar(pulse).getHex() : 0x2a2e36);
+      put(large ? P.lBase : P.sBase, i, p.x, 0.05, p.z, 1, on ? 0xffffff : 0x3a3f4b, large ? 0 : Math.PI / 6);
+      put(large ? P.lOrb : P.sOrb, i, p.x, (large ? 1.15 : 0.42) + Math.sin(t * 2 + idx) * 0.07, p.z, on ? 1 : 0, 0xffffff, t * (large ? 0.8 : 1.6) + idx);
+      put(large ? P.lBeam : P.sBeam, i, p.x, 0.06, p.z, on ? 1 : 0, c.setScalar(0.7 + Math.sin(t * 4 + idx) * 0.3).getHex(), -t * 0.5);
+      if (large) put(P.lRing, i, p.x, 1.15 + Math.sin(t * 2 + idx) * 0.07, p.z, on ? 1 : 0, 0xffffff, t + idx);
     });
-    each(P.small, P.sBase, P.sOrb, P.sHalo, null, false);
-    each(P.large, P.lBase, P.lOrb, P.lHalo, P.lRing, true);
-    for (const k of ['sBase', 'lBase', 'sOrb', 'lOrb', 'sHalo', 'lHalo', 'lRing']) { P[k].instanceMatrix.needsUpdate = true; if (P[k].instanceColor) P[k].instanceColor.needsUpdate = true; }
+    each(P.small, false);
+    each(P.large, true);
+    for (const k of PAD_PARTS) { P[k].instanceMatrix.needsUpdate = true; if (P[k].instanceColor) P[k].instanceColor.needsUpdate = true; }
   }
 
   clearCars() { for (const c of this.cars.values()) { this.scene.remove(c.obj); disposeObject(c.obj); } this.cars.clear(); }
@@ -266,7 +356,14 @@ export class GameRenderer {
       const obj = buildCar(r.cos, col);
       let plate = null;
       if (r.pid !== myPid) { plate = nameSprite(r.name || '?', col.css); obj.add(plate); plate.position.set(0, 1.25, 0); plate.userData.keepUpright = true; }
-      obj.traverse((o) => { if (o.isMesh) o.castShadow = this.settings.quality === 'high'; });
+      obj.traverse((o) => {
+        if (!o.isMesh) return;
+        o.castShadow = this.settings.quality === 'high';
+        const m = o.material;
+        if (this.arenaEnv && m && m.isMeshStandardMaterial && (m.metalness > 0.2 || m.clearcoat > 0)) { m.envMap = this.arenaEnv.texture; m.envMapIntensity = 1.6; m.needsUpdate = true; }
+      });
+      const blob = new THREE.Mesh(_blobGeo || (_blobGeo = new THREE.PlaneGeometry(2.6, 3.4).rotateX(-Math.PI / 2)), new THREE.MeshBasicMaterial({ map: blobTexture(), transparent: true, depthWrite: false, opacity: 0.75, polygonOffset: true, polygonOffsetFactor: -4 }));
+      blob.position.y = -0.33; blob.renderOrder = 1; blob.userData.contact = true; obj.add(blob);
       this.scene.add(obj);
       this.cars.set(r.pid, { obj, key, plate, trail: r.cos?.trail || 'ion', team: r.team, spin: 0 });
     }
@@ -323,6 +420,8 @@ export class GameRenderer {
       }
       if (rc.obj.userData.halo) rc.obj.userData.halo.rotation.z += dt;
       if (rc.plate) rc.plate.visible = !!s.nameplates && !c.hidden;
+      const blob = rc.obj.children.find((o) => o.userData.contact);
+      if (blob) blob.material.opacity += ((c.onGround ? 0.75 : 0) - blob.material.opacity) * Math.min(1, dt * 12);
     }
     // ball
     const b = view.ball;
@@ -342,12 +441,22 @@ export class GameRenderer {
       this.ballOutline.visible = !!s.ballOutline;
       this.ballOutline.position.copy(b.pos);
     } else this.ballOutline.visible = false;
-    // pads
+    // dropshot: ball glows in the charging team's colour, brighter per charge level
+    const bm = this.ball.material;
+    if (view.drop && view.drop.active && view.drop.team >= 0) {
+      bm.emissive.set((this.colors[view.drop.team] || this.colors[0]).main);
+      bm.emissiveIntensity = [0, 0.45, 1.1, 2.2][view.drop.level] * (0.85 + Math.sin(this.time * (4 + view.drop.level * 3)) * 0.15);
+    } else if (bm.emissiveIntensity !== 0.3) { bm.emissive.set(0x1e293b); bm.emissiveIntensity = 0.3; }
+    // pads, tiles, animated scenery
     if (view.pads) this.updatePads(view.pads, this.time);
+    if (this.arenaObj?.setTiles) this.arenaObj.setTiles(view.tiles || null, this.time);
+    this.arenaObj?.update(dt, this.time);
     this.fx.update(dt);
     this.rings.update(dt);
     if (this.flash.intensity > 0) this.flash.intensity = Math.max(0, this.flash.intensity - dt * 900);
-    this.renderer.render(this.scene, this.camera);
+    const look = this.arenaObj?.theme.look || {};
+    const sp = this.rig?.speed || 0;
+    this.renderView(this.scene, this.camera, dt, { ...look, fringe: s.speedFx !== false ? Math.min(1, Math.max(0, (sp - 18) / 6)) * 0.02 : 0 });
   }
 
   goal(pos, team, styleId) {
@@ -373,6 +482,12 @@ export class GameRenderer {
   respawnFx(pos, team) {
     const col = this.colors[team] || this.colors[0];
     this.fx.burst(pos.x, pos.y + 0.3, pos.z, 40, 3, 0.6, 0.2, [col.main, col.light, 0xffffff], { up: 2, endSize: 0.02 });
+  }
+  tileBreak(e) {
+    const col = this.colors[e.team] || this.colors[0];
+    const n = 30 + e.level * 30;
+    this.fx.burst(e.x, 0.3, e.z, n, 5 + e.level * 2, 0.8, 0.22, [col.light, col.main, 0xffffff], { up: 4, endSize: 0.05 });
+    this.rings.add(new THREE.Vector3(e.x, 0.2, e.z), new THREE.Vector3(0, 1, 0), col.main, 3 + e.level * 3, 0.45);
   }
   dust(pos) {
     this.fx.burst(pos.x, 0.15, pos.z, 10, 2.5, 0.6, 0.35, [0x9ca3af], { flat: true, alpha: 0.4, endSize: 0.6 });

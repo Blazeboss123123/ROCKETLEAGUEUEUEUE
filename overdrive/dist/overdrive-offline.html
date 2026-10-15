@@ -232,6 +232,8 @@ table.stats tr.team-head td { font-family: var(--display); letter-spacing: 0.1em
   .scorebug .clock { font-size: 1.4em; min-width: 90px; }
 }
 
+.board-hint { position: absolute; top: 96px; left: 50%; transform: translateX(-50%); font-family: var(--body); font-size: 0.72em; letter-spacing: 0.12em; color: rgba(226,232,240,0.55); text-transform: uppercase; }
+
 </style>
 <div id="app"><div class="ui-layer"></div></div>
 <noscript>Project Overdrive needs JavaScript and WebGL.</noscript>
@@ -269,7 +271,10 @@ const ARENA = {
   length: 96,             // goal line to goal line (m)
   width: 70,              // side wall to side wall (m)
   height: 22,             // floor to ceiling (m)
-  wallCurve: 4.5,         // radius of floor/wall/ceiling transitions (m)
+  mode: 'soccar',         // soccar | hoops | dropshot
+  plan: 'rect',           // rect | hex (plan-view outline)
+  wallCurve: 4.5,         // radius of floor/wall/ceiling transitions on the side walls (m)
+  endCurve: 2.5,          // tighter transition on the back walls: no big ramps beside the goals (m)
   cornerRadius: 15,       // radius of the vertical corner fillets in plan view (m)
   goalWidth: 18,          // goal mouth width (m)
   goalHeight: 6.6,        // goal mouth height (m)
@@ -379,10 +384,42 @@ const BALL = {
 };
 
 // Arena layouts. Competitive arenas share identical geometry; 'skyway' is a casual-only variant.
+// Game modes. Every arena belongs to exactly one mode.
+const GAME_MODES = {
+  soccar: { name: 'Soccar', blurb: 'Classic rocket-car football: get the ball in the net.' },
+  hoops: { name: 'Hoops', blurb: 'Smaller court with raised hoops: the ball has to drop through the rim.' },
+  dropshot: { name: 'Dropshot', blurb: 'No goals. Charge the ball with big hits, smash the floor tiles on their side, and drop it through a hole.' },
+};
+
+// Arena layouts. Soccar arenas share identical competitive geometry; 'skyway' is a casual-only variant.
 const ARENA_VARIANTS = {
-  stadium: { name: 'Overdrive Stadium', competitive: true, params: {} },
-  solstice: { name: 'Solstice Park', competitive: true, params: {} },
-  skyway: { name: 'Skyway (Experimental)', competitive: false, params: { width: 80, height: 30, cornerRadius: 22, wallCurve: 6 } },
+  stadium: { name: 'Overdrive Stadium', mode: 'soccar', competitive: true, params: {} },
+  solstice: { name: 'Solstice Park', mode: 'soccar', competitive: true, params: {} },
+  harbor: { name: 'Neon Harbor', mode: 'soccar', competitive: true, params: {} },
+  frostbite: { name: 'Frostbite Peak', mode: 'soccar', competitive: true, params: {} },
+  mirage: { name: 'Dune Mirage', mode: 'soccar', competitive: true, params: {} },
+  skyway: { name: 'Skyway (Experimental)', mode: 'soccar', competitive: false, params: { width: 80, height: 30, cornerRadius: 22, wallCurve: 6, endCurve: 2.8 } },
+  court: { name: 'Downtown Court', mode: 'hoops', competitive: true, params: { mode: 'hoops', length: 74, width: 58, height: 18, wallCurve: 3.2, endCurve: 2.0, cornerRadius: 10 } },
+  hexcore: { name: 'Hexcore', mode: 'dropshot', competitive: true, params: { mode: 'dropshot', plan: 'hex', length: 96, width: 84, height: 24, wallCurve: 4, endCurve: 4, cornerRadius: 6 } },
+};
+function arenasForMode(mode) { return Object.entries(ARENA_VARIANTS).filter(([, v]) => v.mode === mode).map(([k]) => k); }
+
+const HOOPS = {
+  rimHeight: 4.6,        // height of the rim above the floor (m)
+  rimRadius: 2.9,        // inner ring radius (m)
+  rimTube: 0.14,         // rim thickness (m)
+  wallGap: 0.35,         // gap between the back wall and the rim (m)
+  netDepth: 2.6,         // how far below the rim the net reaches (m)
+  kickoffBallHeight: 7,  // ball drops in from here at kickoff (m)
+};
+
+const DROPSHOT = {
+  tileRadius: 3.6,       // hexagon tile circumradius (m)
+  chargeLevel2: 16,      // accumulated hit strength for a charged ball (m/s)
+  chargeLevel3: 36,      // ... and for a super-charged ball
+  boostRegen: 10,        // boost units per second (no pads in Dropshot)
+  kickoffBallHeight: 6,
+  holeDepth: 8,          // how far below the floor a hole goes before it counts (m)
 };
 
 const BOOST_PADS = {
@@ -437,7 +474,7 @@ const BOTS = {
 
 const BOT_NAMES = ['Axle', 'Nova', 'Piston', 'Rivet', 'Torque', 'Vector', 'Gauge', 'Sprocket', 'Ion', 'Chrome', 'Drift', 'Comet'];
 
-return { PHYSICS, ARENA, CAR, BALL, ARENA_VARIANTS, BOOST_PADS, MATCH, MODES, NET, TEAM_COLORS, TEAM_COLORS_ALT, BOTS, BOT_NAMES };
+return { PHYSICS, ARENA, CAR, BALL, GAME_MODES, ARENA_VARIANTS, arenasForMode, HOOPS, DROPSHOT, BOOST_PADS, MATCH, MODES, NET, TEAM_COLORS, TEAM_COLORS_ALT, BOTS, BOT_NAMES };
 })();
 
 // ---- shared/math.js
@@ -561,94 +598,170 @@ return { V3, Quat, clamp, lerp, sign, round, rng };
 // ---- shared/arena.js
 __m["shared/arena.js"] = (() => {
 // Arena geometry as a signed distance field (SDF).
-// interior(p) returns the distance from p to the nearest arena surface,
-// POSITIVE inside the playable volume (arena + both goal boxes), negative inside walls.
-// The same function drives car/ball collisions, wall driving, camera collision and
-// mesh generation, so visible surfaces and collision surfaces always match.
+// interior(x, y, z) is the distance from a point to the nearest arena surface: POSITIVE inside
+// the playable volume, negative inside walls. The same function drives car/ball collisions,
+// wall driving, camera collision and mesh generation, so visible and collision surfaces match.
+//
+// Plan view is a convex polygon with rounded corners (a rectangle for Soccar/Hoops, an
+// elongated hexagon for Dropshot), extruded and filleted to the floor and ceiling. The back
+// walls use a much tighter fillet than the side walls, so there are no ramps beside the goals.
+// Modes add their own features: goal boxes (Soccar), rims (Hoops), breakable floor (Dropshot).
 
-const { ARENA, BOOST_PADS } = __m["shared/config.js"];
+const { ARENA, BOOST_PADS, HOOPS, DROPSHOT } = __m["shared/config.js"];
 const { V3 } = __m["shared/math.js"];
 
+const SQ3 = Math.sqrt(3);
+
 class Arena {
-  constructor(params = ARENA) {
+  constructor(params = {}) {
     this.p = { ...ARENA, ...params };
     const a = this.p;
+    this.mode = a.mode || 'soccar';
     this.halfL = a.length / 2;
     this.halfW = a.width / 2;
     this.halfH = a.height / 2;
+    this.rSide = a.wallCurve;
+    this.rEnd = a.endCurve ?? a.wallCurve;
+    this.Rc = a.cornerRadius;
+    // ---- plan polygon (outer outline before corner rounding), counter-clockwise in (x, z)
+    if (a.plan === 'hex') {
+      const t = this.halfW * 0.5;
+      this.outer = [[t, -this.halfL], [this.halfW, 0], [t, this.halfL], [-t, this.halfL], [-this.halfW, 0], [-t, -this.halfL]];
+    } else {
+      this.outer = [[this.halfW, -this.halfL], [this.halfW, this.halfL], [-this.halfW, this.halfL], [-this.halfW, -this.halfL]];
+    }
+    this.isRect = a.plan !== 'hex';
+    this.inner = insetPolygon(this.outer, this.Rc);
+    // ---- soccar goals
     this.goalHalfW = a.goalWidth / 2;
-    // goal box: overlaps past the floor fillet so the goal mouth has no lip
-    this.goalZ0 = this.halfL - a.wallCurve - 0.5;
+    this.goalZ0 = this.halfL - this.rEnd - 0.6; // goal box reaches past the back-wall fillet: flat goal mouth
     this.goalZ1 = this.halfL + a.goalDepth;
     this.goalCZ = (this.goalZ0 + this.goalZ1) / 2;
     this.goalHZ = (this.goalZ1 - this.goalZ0) / 2;
-    this.pads = buildPadLayout(this);
+    // ---- hoops
+    this.rimY = HOOPS.rimHeight;
+    this.rimR = HOOPS.rimRadius + HOOPS.rimTube; // centre-line radius of the rim tube
+    this.hoopZ = this.halfL - this.rimR - HOOPS.rimTube - HOOPS.wallGap;
+    // ---- dropshot tiles
+    this.tiles = [];
+    this.tileState = null; // Uint8Array owned by the World: 0 intact, 1 damaged, 2 open
+    this.tileIndex = new Map();
+    if (this.mode === 'dropshot') this.buildTiles();
+    this.pads = this.mode === 'dropshot' ? [] : buildPadLayout(this);
   }
 
-  // signed distance, positive inside the playable space
-  interior(x, y, z) {
-    const a = this.p;
-    // --- main bowl: rounded-rectangle plan, extruded, with filleted floor/ceiling edges
-    const r = a.wallCurve, Rc = a.cornerRadius;
-    const qx = Math.abs(x) - (this.halfW - Rc);
-    const qz = Math.abs(z) - (this.halfL - Rc);
-    const ox = qx > 0 ? qx : 0, oz = qz > 0 ? qz : 0;
-    const d2 = Math.sqrt(ox * ox + oz * oz) + Math.min(Math.max(qx, qz), 0) - Rc; // <0 inside plan
+  // ---------------------------------------------------------------- plan helpers
+  // signed distance to the rounded plan outline (negative inside), plus how "side-wall" the
+  // nearest wall is (1 = side wall, 0 = back wall) for the variable fillet radius.
+  planDist(x, z) {
+    if (this.isRect) {
+      const qx = Math.abs(x) - (this.halfW - this.Rc), qz = Math.abs(z) - (this.halfL - this.Rc);
+      const ox = qx > 0 ? qx : 0, oz = qz > 0 ? qz : 0;
+      const d = Math.sqrt(ox * ox + oz * oz) + Math.min(Math.max(qx, qz), 0) - this.Rc;
+      let side;
+      if (qx > 0 && qz > 0) { const l = Math.sqrt(qx * qx + qz * qz); side = (qx / l) * (qx / l); }
+      else side = qx > qz ? 1 : 0;
+      this._side = side;
+      return d;
+    }
+    this._side = 1;
+    return sdPolygon(this.inner, x, z) - this.Rc;
+  }
+  wallCurveFor(side) { return this.rEnd + (this.rSide - this.rEnd) * side; }
+
+  // extruded bowl with floor at floorY
+  bowl(x, y, z, floorY) {
+    const d2 = this.planDist(x, z);
+    const r = this.isRect ? this.wallCurveFor(this._side) : this.rSide;
+    const H = this.p.height;
+    const c = (H + floorY) / 2, half = (H - floorY) / 2;
     const u = d2 + r;
-    const v = Math.abs(y - this.halfH) - (this.halfH - r);
+    const v = Math.abs(y - c) - (half - r);
     const ou = u > 0 ? u : 0, ov = v > 0 ? v : 0;
-    const dMain = Math.sqrt(ou * ou + ov * ov) + Math.min(Math.max(u, v), 0) - r;
-    // --- goal boxes (mirrored in z)
-    const g = a.goalCurve;
-    const bx = Math.abs(x) - (this.goalHalfW - g);
-    const by = Math.abs(y - a.goalHeight / 2) - (a.goalHeight / 2 - g);
-    const bz = Math.abs(Math.abs(z) - this.goalCZ) - (this.goalHZ - g);
-    const obx = bx > 0 ? bx : 0, oby = by > 0 ? by : 0, obz = bz > 0 ? bz : 0;
-    const dGoal = Math.sqrt(obx * obx + oby * oby + obz * obz) + Math.min(Math.max(bx, Math.max(by, bz)), 0) - g;
-    // union of free space
-    return Math.max(-dMain, -dGoal);
+    return Math.sqrt(ou * ou + ov * ov) + Math.min(Math.max(u, v), 0) - r; // <0 inside
   }
 
-  // Inward-pointing surface normal at p (gradient of interior), written into out.
-  normal(x, y, z, out) {
+  // ---------------------------------------------------------------- SDF
+  interior(x, y, z, forBall = false) {
+    let floorY = 0;
+    if (forBall && this.mode === 'dropshot' && y < 2.5 && this.holeAt(x, z, y)) floorY = -DROPSHOT.holeDepth;
+    let d = -this.bowl(x, y, z, floorY);
+    if (this.mode === 'soccar') {
+      const a = this.p, g = a.goalCurve;
+      const bx = Math.abs(x) - (this.goalHalfW - g);
+      const by = Math.abs(y - a.goalHeight / 2) - (a.goalHeight / 2 - g);
+      const bz = Math.abs(Math.abs(z) - this.goalCZ) - (this.goalHZ - g);
+      const obx = bx > 0 ? bx : 0, oby = by > 0 ? by : 0, obz = bz > 0 ? bz : 0;
+      const dGoal = Math.sqrt(obx * obx + oby * oby + obz * obz) + Math.min(Math.max(bx, Math.max(by, bz)), 0) - g;
+      if (-dGoal > d) d = -dGoal;
+    } else if (this.mode === 'hoops') {
+      // solid rim tube (torus) at each end: free space is outside it
+      const dz = Math.abs(z) - this.hoopZ;
+      const qx = Math.sqrt(x * x + dz * dz) - this.rimR, qy = y - this.rimY;
+      const dRim = Math.sqrt(qx * qx + qy * qy) - HOOPS.rimTube;
+      if (dRim < d) d = dRim;
+    }
+    return d;
+  }
+
+  // Inward-pointing surface normal (gradient of interior).
+  normal(x, y, z, out, forBall = false) {
     const e = 0.01;
-    const nx = this.interior(x + e, y, z) - this.interior(x - e, y, z);
-    const ny = this.interior(x, y + e, z) - this.interior(x, y - e, z);
-    const nz = this.interior(x, y, z + e) - this.interior(x, y, z - e);
+    const nx = this.interior(x + e, y, z, forBall) - this.interior(x - e, y, z, forBall);
+    const ny = this.interior(x, y + e, z, forBall) - this.interior(x, y - e, z, forBall);
+    const nz = this.interior(x, y, z + e, forBall) - this.interior(x, y, z - e, forBall);
     out.set(nx, ny, nz);
     const l = out.len();
     if (l < 1e-9) out.set(0, 1, 0); else out.scale(1 / l);
     return out;
   }
 
-  // Which goal (if any) the ball is fully inside. Returns team index that CONCEDED or -1.
-  // A goal requires the entire ball to be past the goal line inside the mouth.
-  goalConceded(ball, radius) {
-    const pz = ball.z;
-    if (Math.abs(ball.x) > this.goalHalfW || ball.y > this.p.goalHeight) return -1;
-    if (pz > this.halfL + radius) return 1;   // orange goal (+Z) — orange concedes
-    if (pz < -this.halfL - radius) return 0;  // blue goal (-Z)
+  // ---------------------------------------------------------------- scoring
+  // Team that CONCEDED (whose goal / hoop / floor the ball is in), or -1.
+  goalConceded(pos, radius, vel) {
+    if (this.mode === 'hoops') {
+      const dz = Math.abs(pos.z) - this.hoopZ;
+      const dist = Math.sqrt(pos.x * pos.x + dz * dz);
+      if (dist < HOOPS.rimRadius - 0.15 && pos.y < this.rimY - radius * 0.35 && pos.y > this.rimY - HOOPS.netDepth - radius && (!vel || vel.y < 1)) return pos.z > 0 ? 1 : 0;
+      return -1;
+    }
+    if (this.mode === 'dropshot') {
+      if (pos.y < -1.2) return pos.z > 0 ? 1 : 0;
+      return -1;
+    }
+    if (Math.abs(pos.x) > this.goalHalfW || pos.y > this.p.goalHeight) return -1;
+    if (pos.z > this.halfL + radius) return 1;   // orange goal (+Z) — orange concedes
+    if (pos.z < -this.halfL - radius) return 0;  // blue goal (-Z)
     return -1;
   }
 
   goalCenter(team, out = new V3()) {
-    // centre of the goal mouth defended by `team`
-    return out.set(0, this.p.goalHeight / 2, team === 0 ? -this.halfL : this.halfL);
+    const s = team === 0 ? -1 : 1;
+    if (this.mode === 'hoops') return out.set(0, this.rimY, s * this.hoopZ);
+    if (this.mode === 'dropshot') return out.set(0, 0, s * this.halfL * 0.5);
+    return out.set(0, this.p.goalHeight / 2, s * this.halfL);
+  }
+
+  // Ball placement at kickoff (height depends on mode).
+  kickoffBallY(radius) {
+    if (this.mode === 'hoops') return HOOPS.kickoffBallHeight;
+    if (this.mode === 'dropshot') return DROPSHOT.kickoffBallHeight;
+    return radius;
   }
 
   inBounds(p) {
-    return p.isFinite() && Math.abs(p.x) < this.p.worldLimit && Math.abs(p.z) < this.p.worldLimit && p.y > -5 && p.y < this.p.height + 10;
+    return p.isFinite() && Math.abs(p.x) < this.p.worldLimit && Math.abs(p.z) < this.p.worldLimit && p.y > -DROPSHOT.holeDepth - 5 && p.y < this.p.height + 10;
   }
 
   // Kickoff spawn positions for a team. Returns [{pos, yaw}] (yaw: rotation about +Y, 0 faces +Z).
   kickoffSpawns(team, count, seedRand) {
     const L = this.halfL;
     const s = L / 48; // scale positions with arena length
+    const w = Math.min(1, this.halfW / 35);
     const dir = team === 0 ? -1 : 1;
-    const diagonal = [{ x: -19 * s, z: 24 * s }, { x: 19 * s, z: 24 * s }];
+    const diagonal = [{ x: -19 * s * w, z: 24 * s }, { x: 19 * s * w, z: 24 * s }];
     const offCenter = [{ x: -2.5, z: 36 * s }, { x: 2.5, z: 36 * s }];
-    const back = { x: 0, z: 43 * s };
-    // pick a deterministic, symmetric pattern
+    const back = { x: 0, z: 43 * s - (this.mode === 'hoops' ? 4 : 0) };
     const r = seedRand ? seedRand() : 0;
     let order;
     if (count === 1) order = [r < 0.4 ? diagonal[r < 0.2 ? 0 : 1] : r < 0.8 ? offCenter[r < 0.6 ? 0 : 1] : back];
@@ -661,12 +774,126 @@ class Arena {
       // orange is the point-mirror of blue so kickoffs are perfectly fair
       const px = team === 0 ? o.x : -o.x;
       const pos = new V3(px, 0.36, dir * o.z);
-      // face the ball
       const yaw = Math.atan2(-pos.x, -pos.z);
       out.push({ pos, yaw });
     }
     return out;
   }
+
+  // ---------------------------------------------------------------- dropshot floor
+  // Flat-top hexagon tiles in axial coordinates (q, r): centre x = 1.5 R q, z = sqrt3 R (r + q/2).
+  buildTiles() {
+    const R = DROPSHOT.tileRadius;
+    const margin = this.rSide + R * 0.55;
+    const n = Math.ceil(Math.max(this.halfL, this.halfW) / R) + 2;
+    for (let q = -n; q <= n; q++) for (let r = -2 * n; r <= 2 * n; r++) {
+      const x = 1.5 * R * q, z = SQ3 * R * (r + q / 2);
+      if (Math.abs(z) < 1e-6) continue; // no tile straddles the halfway line
+      if (this.planDist(x, z) > -margin) continue;
+      const t = { q, r, x, z, team: z < 0 ? 0 : 1 };
+      this.tileIndex.set(q + ',' + r, this.tiles.length);
+      this.tiles.push(t);
+    }
+  }
+  tileAt(x, z) {
+    const R = DROPSHOT.tileRadius;
+    const fq = (2 / 3) * x / R, fr = (-x / 3 + (SQ3 / 3) * z) / R;
+    // cube rounding
+    let rx = Math.round(fq), rz = Math.round(fr), ry = Math.round(-fq - fr);
+    const dx = Math.abs(rx - fq), dz = Math.abs(rz - fr), dy = Math.abs(ry + fq + fr);
+    if (dx > dy && dx > dz) rx = -ry - rz; else if (dy <= dz) rz = -rx - ry;
+    const i = this.tileIndex.get(rx + ',' + rz);
+    return i === undefined ? -1 : i;
+  }
+  holeAt(x, z, y) {
+    if (!this.tileState) return false;
+    const i = this.tileAt(x, z);
+    if (i >= 0 && this.tileState[i] >= 2) return true;
+    if (y < -0.1) {
+      // already below the floor: keep the hole open around the edges so the ball cannot snag
+      const R = DROPSHOT.tileRadius * 0.6;
+      for (const [ox, oz] of [[R, 0], [-R, 0], [0, R], [0, -R]]) { const j = this.tileAt(x + ox, z + oz); if (j >= 0 && this.tileState[j] >= 2) return true; }
+    }
+    return false;
+  }
+  tilesWithin(i, radius) {
+    const t = this.tiles[i], out = [];
+    for (let j = 0; j < this.tiles.length; j++) {
+      const u = this.tiles[j];
+      if (u.team !== t.team) continue;
+      const dq = u.q - t.q, dr = u.r - t.r;
+      if ((Math.abs(dq) + Math.abs(dr) + Math.abs(dq + dr)) / 2 <= radius) out.push(j);
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------------- outline for mesh building
+  // Perimeter as a list of columns {x, z, nx, nz, r, end}: rounded-polygon outline points with
+  // outward normals and the local fillet radius. Goal-mouth edges get exact columns at the posts.
+  outline(step = 1.2) {
+    const inn = this.inner, n = inn.length, cols = [];
+    const push = (x, z, nx, nz, endWall) => {
+      const side = this.isRect ? nx * nx : 1;
+      cols.push({ x, z, nx, nz, r: this.isRect ? this.wallCurveFor(side) : this.rSide, endWall });
+    };
+    for (let i = 0; i < n; i++) {
+      const [ax, az] = inn[i], [bx, bz] = inn[(i + 1) % n];
+      const ex = bx - ax, ez = bz - az, len = Math.hypot(ex, ez);
+      const nx = ez / len, nz = -ex / len; // outward normal for a CCW polygon
+      // straight edge from a to b, offset by Rc
+      const ts = [0];
+      if (this.mode === 'soccar' && Math.abs(nz) > 0.99) {
+        for (const gx of [-this.goalHalfW, this.goalHalfW]) { const t = (gx - ax) / (ex || 1e-9); if (t > 0 && t < 1) ts.push(t); }
+      }
+      const m = Math.max(1, Math.round(len / step));
+      for (let k = 1; k < m; k++) ts.push(k / m);
+      ts.sort((p, q) => p - q);
+      for (const t of ts) push(ax + ex * t + nx * this.Rc, az + ez * t + nz * this.Rc, nx, nz, Math.abs(nz) > 0.99);
+      // corner arc around b, from this edge's normal to the next edge's normal
+      const [cx, cz] = inn[(i + 2) % n];
+      const fx = cx - bx, fz = cz - bz, fl = Math.hypot(fx, fz);
+      const mx = fz / fl, mz = -fx / fl;
+      const a0 = Math.atan2(nz, nx); let a1 = Math.atan2(mz, mx);
+      while (a1 < a0) a1 += Math.PI * 2;
+      const steps = Math.max(2, Math.round(((a1 - a0) * this.Rc) / step));
+      for (let k = 0; k < steps; k++) {
+        const ang = a0 + ((a1 - a0) * k) / steps;
+        const cxn = Math.cos(ang), czn = Math.sin(ang);
+        push(bx + cxn * this.Rc, bz + czn * this.Rc, cxn, czn, false);
+      }
+    }
+    return cols;
+  }
+}
+
+// Convex polygon (CCW) inset by d: offset every edge inwards and intersect neighbours.
+function insetPolygon(poly, d) {
+  const n = poly.length, out = [];
+  for (let i = 0; i < n; i++) {
+    const [px, pz] = poly[(i + n - 1) % n], [cx, cz] = poly[i], [nx, nz] = poly[(i + 1) % n];
+    const e1x = cx - px, e1z = cz - pz, l1 = Math.hypot(e1x, e1z);
+    const e2x = nx - cx, e2z = nz - cz, l2 = Math.hypot(e2x, e2z);
+    // inward normals for CCW: (-ez, ex)
+    const n1x = -e1z / l1, n1z = e1x / l1, n2x = -e2z / l2, n2z = e2x / l2;
+    const k = d / (1 + n1x * n2x + n1z * n2z);
+    out.push([cx + (n1x + n2x) * k, cz + (n1z + n2z) * k]);
+  }
+  return out;
+}
+
+// Exact signed distance to a polygon (negative inside).
+function sdPolygon(v, x, z) {
+  let d = (x - v[0][0]) ** 2 + (z - v[0][1]) ** 2, s = 1;
+  for (let i = 0, j = v.length - 1; i < v.length; j = i, i++) {
+    const ex = v[j][0] - v[i][0], ez = v[j][1] - v[i][1];
+    const wx = x - v[i][0], wz = z - v[i][1];
+    const t = Math.max(0, Math.min(1, (wx * ex + wz * ez) / (ex * ex + ez * ez)));
+    const bx = wx - ex * t, bz = wz - ez * t;
+    d = Math.min(d, bx * bx + bz * bz);
+    const c1 = z >= v[i][1], c2 = z < v[j][1], c3 = ex * wz > ez * wx;
+    if ((c1 && c2 && c3) || (!c1 && !c2 && !c3)) s = -s;
+  }
+  return s * Math.sqrt(d);
 }
 
 // Designed boost layout: mirrored across both axes. Large pads at the mid-side lanes and in
@@ -676,15 +903,14 @@ function buildPadLayout(arena) {
   const sx = arena.halfW / 35, sz = arena.halfL / 48;
   const pads = [];
   const add = (x, z, large) => pads.push({ x: x * sx, y: 0, z: z * sz, large, id: pads.length });
-  // large
   add(-29, 0, true); add(29, 0, true);
   for (const z of [-37, 37]) { add(-27, z, true); add(27, z, true); }
-  // small, quadrant-mirrored
   add(-12, 0, false); add(12, 0, false);
   for (const z of [-10, 10]) { add(0, z, false); add(-20, z, false); add(20, z, false); }
   for (const z of [-22, 22]) { add(-8, z, false); add(8, z, false); add(-30, z, false); add(30, z, false); }
   for (const z of [-32, 32]) { add(0, z, false); add(-16, z, false); add(16, z, false); }
-  for (const z of [-43, 43]) { add(-10, z, false); add(10, z, false); }
+  if (arena.mode === 'soccar') for (const z of [-43, 43]) { add(-10, z, false); add(10, z, false); }
+  else for (const z of [-41, 41]) { add(-14, z, false); add(14, z, false); }
   for (const p of pads) {
     const cfg = p.large ? BOOST_PADS.large : BOOST_PADS.small;
     p.amount = cfg.amount; p.respawn = cfg.respawn; p.radius = cfg.radius; p.height = cfg.height;
@@ -1058,11 +1284,12 @@ function integrateBall(ball, dt) {
 function collideBallArena(ball, arena, dt) {
   const R = ball.radius;
   const p = ball.pos;
-  const s = arena.interior(p.x, p.y, p.z);
+  const s = arena.interior(p.x, p.y, p.z, true);
   ball.onSurface = false;
   if (s >= R + 0.02) return 0;
-  const n = arena.normal(p.x, p.y, p.z, _n);
+  const n = arena.normal(p.x, p.y, p.z, _n, true);
   ball.onSurface = true;
+  ball.contactNy = n.y;
   if (s < R) p.addScaled(n, R - s); // positional correction
   const vn = ball.vel.dot(n);
   if (vn >= 0) return 0;
@@ -1335,7 +1562,7 @@ __m["shared/world.js"] = (() => {
 // Runs identically on the dedicated server, on a browser host, in offline matches and in
 // client-side prediction. One call to step() advances exactly one fixed tick.
 
-const { PHYSICS, MATCH, BALL, CAR } = __m["shared/config.js"];
+const { PHYSICS, MATCH, BALL, CAR, DROPSHOT } = __m["shared/config.js"];
 const _demoHits = [];
 const { V3, Quat, rng, round } = __m["shared/math.js"];
 const { Arena } = __m["shared/arena.js"];
@@ -1373,6 +1600,11 @@ class World {
       score: [0, 0], kickoffs: 0, goalSeq: 0, lastGoal: null, waitingGround: false,
     };
     this.ballHidden = false;
+    this.mode = this.arena.mode;
+    // Dropshot: breakable floor and ball charge
+    this.tiles = this.mode === 'dropshot' ? new Uint8Array(this.arena.tiles.length) : null;
+    this.arena.tileState = this.tiles;
+    this.drop = { charge: 0, level: 1, active: false, team: -1, seq: 0 };
     this.demoSeq = 0; this.lastDemo = null;
     this.lastTouch = null;   // {id, team, tick}
     this.touchHistory = [];  // recent touches for assists
@@ -1425,9 +1657,11 @@ class World {
         c.frozen = true;
       });
     }
-    this.ball.reset();
+    this.ball.reset(this.arena.kickoffBallY(this.ball.radius));
     this.ballHidden = false;
     this.pads.fill(0);
+    if (this.tiles) this.tiles.fill(0);
+    this.drop.charge = 0; this.drop.level = 1; this.drop.active = false; this.drop.team = -1;
     this.lastTouch = null; this.touchHistory = []; this.pendingEval = null; this.shotBy = -1;
     m.state = 'countdown';
     m.timer = MATCH.countdown;
@@ -1479,6 +1713,7 @@ class World {
       const inp = this.inputs.get(car.id) || neutralInput();
       stepCarControls(car, inp, this.arena, dt, this.emitEvents ? this.events : null);
       if (this.unlimitedBoost) car.boost = 100;
+      else if (this.mode === 'dropshot' && !car.frozen) car.boost = Math.min(100, car.boost + DROPSHOT.boostRegen * dt);
       integrateCar(car, dt);
     }
     // ---- ball ----
@@ -1507,6 +1742,7 @@ class World {
     if (ballActive) {
       const bimp = collideBallArena(ball, this.arena, dt);
       if (bimp > 3) this.event({ type: 'ballWall', speed: bimp, x: ball.pos.x, y: ball.pos.y, z: ball.pos.z });
+      if (this.tiles && ball.onSurface && ball.contactNy > 0.8 && ball.pos.y < ball.radius + 0.3) this.dropshotFloorHit();
       // alternate the resolution order every tick so simultaneous challenges are fair to both teams
       const n = this.cars.length, rev = this.tick & 1;
       for (let k = 0; k < n; k++) {
@@ -1533,10 +1769,11 @@ class World {
           else { m.overtime = true; m.clock = 0; m.waitingGround = false; this.event({ type: 'overtime' }); this.kickoff(); }
         }
       }
-      // ball threat tracking for save detection (cheap, a few times per second)
-      if (ballActive && --this.headingTimer <= 0) {
-        this.headingTimer = 12;
-        this.heading = ballHeading(ball, this.arena, 2.0);
+      // ball threat tracking for save detection: where the ball is really going (wall bounces and
+      // long rollers included) just before a defender touches it
+      if (ballActive && !this.pendingEval && --this.headingTimer <= 0) {
+        this.headingTimer = 6;
+        this.heading = ballHeading(ball, this.arena, 3.5);
       }
     }
   }
@@ -1612,7 +1849,30 @@ class World {
     }
   }
 
+  // Dropshot: a ball hit by a team damages the other team's floor when it lands there.
+  dropshotFloorHit() {
+    const d = this.drop, b = this.ball;
+    if (!d.active) return;
+    const side = b.pos.z < 0 ? 0 : 1;
+    if (side === d.team) return;
+    const i = this.arena.tileAt(b.pos.x, b.pos.z);
+    if (i < 0) return;
+    for (const j of this.arena.tilesWithin(i, d.level - 1)) this.tiles[j] = Math.min(2, this.tiles[j] + 1);
+    this.event({ type: 'tiles', x: b.pos.x, z: b.pos.z, level: d.level, team: side });
+    d.seq++;
+    d.active = false; d.charge = 0; d.level = 1;
+  }
+
   onTouch(car, deltaSpeed) {
+    if (this.tiles) {
+      const d = this.drop;
+      if (d.team !== car.team) { d.charge = Math.max(0, d.charge * 0.5); }
+      d.active = true; d.team = car.team;
+      d.charge += deltaSpeed;
+      const lv = d.charge >= DROPSHOT.chargeLevel3 ? 3 : d.charge >= DROPSHOT.chargeLevel2 ? 2 : 1;
+      if (lv > d.level) this.event({ type: 'charge', level: lv });
+      d.level = Math.max(d.level, lv);
+    }
     const t = { id: car.id, team: car.team, tick: this.tick };
     const prev = this.lastTouch;
     this.lastTouch = t;
@@ -1642,7 +1902,7 @@ class World {
   checkGoal() {
     const m = this.match;
     if (m.state !== 'live' && m.state !== 'free') return;
-    const conceded = this.arena.goalConceded(this.ball.pos, this.ball.radius);
+    const conceded = this.arena.goalConceded(this.ball.pos, this.ball.radius, this.ball.vel);
     if (conceded < 0) return;
     const team = 1 - conceded;
     const speed = this.ball.vel.len();
@@ -1661,9 +1921,13 @@ class World {
       const st = this.stats.get(scorer);
       if (st) { st.goals++; st.score += 100; if (this.shotBy !== scorer) { st.shots++; st.score += 20; } }
       this.shotBy = -1;
-      for (let i = this.touchHistory.length - 1; i >= 0; i--) {
+      // assist: the last teammate touch within the window before the scorer's first touch of this
+      // possession (measured from that touch, not from the goal, so long rollers still count)
+      let ref = this.tick, i = this.touchHistory.length - 1;
+      while (i >= 0 && this.touchHistory[i].id === scorer) { ref = this.touchHistory[i].tick; i--; }
+      for (; i >= 0; i--) {
         const h = this.touchHistory[i];
-        if ((this.tick - h.tick) * this.dt > MATCH.assistWindow) break;
+        if ((ref - h.tick) * this.dt > MATCH.assistWindow) break;
         if (h.id !== scorer && h.team === team) {
           assist = h.id; const sa = this.stats.get(assist); if (sa) { sa.assists++; sa.score += 50; }
           break;
@@ -1714,6 +1978,7 @@ class World {
     }
     const m = this.match;
     m.timer = round(m.timer, 1000); m.clock = round(m.clock, 1000);
+    this.drop.charge = round(this.drop.charge, 100);
     for (let i = 0; i < this.pads.length; i++) this.pads[i] = round(this.pads[i], 100);
   }
 
@@ -1723,7 +1988,8 @@ class World {
     const match = [SC[m.state], m.timer, m.clock, m.overtime ? 1 : 0, m.score[0], m.score[1], m.kickoffs, m.goalSeq,
       lg ? lg.team : -1, lg ? lg.scorer : -1, lg ? lg.assist : -1, lg ? lg.speed : 0, m.waitingGround ? 1 : 0, this.ballHidden ? 1 : 0,
       this.lastTouch ? this.lastTouch.id : -1, this.lastTouch ? this.tick - this.lastTouch.tick : 0,
-      this.demoSeq, this.lastDemo ? this.lastDemo.victim : -1, this.lastDemo ? this.lastDemo.attacker : -1];
+      this.demoSeq, this.lastDemo ? this.lastDemo.victim : -1, this.lastDemo ? this.lastDemo.attacker : -1,
+      this.drop.charge, this.drop.level, this.drop.active ? 1 : 0, this.drop.team, this.drop.seq];
     const ball = [b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.angVel.x, b.angVel.y, b.angVel.z];
     const cars = this.cars.map((c) => {
       const flags = (c.onGround ? 1 : 0) | (c.jumped ? 2 : 0) | (c.jumping ? 4 : 0) | (c.doubleJumped ? 8 : 0) |
@@ -1735,11 +2001,11 @@ class World {
     });
     const pads = [];
     for (let i = 0; i < this.pads.length; i++) if (this.pads[i] > 0) pads.push(i, this.pads[i]);
-    return [this.tick, match, ball, cars, pads];
+    return [this.tick, match, ball, cars, pads, this.tiles ? this.tiles.join('') : 0];
   }
 
   applySnapshot(s) {
-    const [tick, match, ball, cars, pads] = s;
+    const [tick, match, ball, cars, pads, tiles] = s;
     this.tick = tick;
     const m = this.match;
     m.state = STATES[match[0]] || 'waiting'; m.timer = match[1]; m.clock = match[2]; m.overtime = !!match[3];
@@ -1748,6 +2014,8 @@ class World {
     m.waitingGround = !!match[12]; this.ballHidden = !!match[13];
     this.lastTouch = match[14] >= 0 ? { id: match[14], team: -1, tick: tick - match[15] } : null;
     this.demoSeq = match[16] || 0; this.lastDemo = match[17] >= 0 ? { victim: match[17], attacker: match[18] } : null;
+    if (match.length > 19) { const d = this.drop; d.charge = match[19]; d.level = match[20]; d.active = !!match[21]; d.team = match[22]; d.seq = match[23]; }
+    if (this.tiles && typeof tiles === 'string' && tiles.length === this.tiles.length) for (let i = 0; i < tiles.length; i++) this.tiles[i] = tiles.charCodeAt(i) - 48;
     const b = this.ball;
     b.pos.set(ball[0], ball[1], ball[2]); b.vel.set(ball[3], ball[4], ball[5]); b.angVel.set(ball[6], ball[7], ball[8]);
     const seen = new Set();
@@ -1813,7 +2081,7 @@ __m["shared/protocol.js"] = (() => {
 //   {t:'end', mid, score, winner, stats}   {t:'pong', c, s}   {t:'chat', pid, q}
 //   {t:'closed', reason}   {t:'error', code, msg}
 
-const PROTOCOL_VERSION = 4;
+const PROTOCOL_VERSION = 5;
 
 const QUICK_CHAT = [
   'Nice shot!', 'Great pass!', 'What a save!', 'I got it!', 'Need boost!', 'Take the shot!',
@@ -2273,7 +2541,7 @@ class Bot {
   decide(world, car) {
     const ball = world.ball, arena = world.arena;
     const team = car.team, dir = team === 0 ? 1 : -1; // attacking direction along z
-    const ownGoalZ = team === 0 ? -arena.halfL : arena.halfL;
+    const ownGoalZ = arena.goalCenter(team, _tmp).z;
     const pred = prediction(world);
     if (world.ballHidden) return { kind: 'position', x: 0, z: ownGoalZ * 0.5, speed: 0.6 };
 
@@ -2331,19 +2599,19 @@ class Bot {
   }
 
   threatened(pred, arena, team) {
+    const p = _aim, v = _tgt;
     for (let i = 0; i < pred.length; i += 2) {
       const s = pred[i];
-      if (Math.abs(s.x) < arena.goalHalfW + 1 && s.y < arena.p.goalHeight + 0.5) {
-        if (team === 0 ? s.z < -arena.halfL + 1 : s.z > arena.halfL - 1) return true;
-      }
+      p.set(s.x, s.y, s.z); v.set(s.vx, s.vy, s.vz);
+      if (arena.goalConceded(p, 0.95, v) === team) return true;
     }
     return false;
   }
 
   intercept(world, car, pred, dir, threat) {
     const arena = world.arena;
-    const oppGoalZ = dir * (arena.halfL + 3);
-    const ownGoalZ = -dir * arena.halfL;
+    const oppGoalZ = arena.mode === 'soccar' ? dir * (arena.halfL + 3) : arena.goalCenter(car.team === 0 ? 1 : 0, _tmp).z;
+    const ownGoalZ = arena.mode === 'soccar' ? -dir * arena.halfL : arena.goalCenter(car.team, _tmp).z;
     const avgSpeed = (car.boost > 15 && this.cfg.boostUse > 0.3 ? 17 : 12) * this.cfg.speedFactor;
     for (let i = 0; i < pred.length; i++) {
       const s = pred[i];
@@ -2526,7 +2794,7 @@ __m["shared/host.js"] = (() => {
 // client messages to handle(pid, msg), calls tick() at PHYSICS.tickRate, and delivers what
 // it receives through out(pid | null, msg)   (null = broadcast).
 
-const { PHYSICS, NET, MODES, MATCH, BOT_NAMES, ARENA_VARIANTS } = __m["shared/config.js"];
+const { PHYSICS, NET, MODES, MATCH, BOT_NAMES, ARENA_VARIANTS, GAME_MODES, arenasForMode } = __m["shared/config.js"];
 const { World, unpackInput, quantizeInput } = __m["shared/world.js"];
 const { Bot } = __m["shared/bot.js"];
 const { neutralInput } = __m["shared/car.js"];
@@ -2549,8 +2817,12 @@ class MatchHost {
     this.fill = opts.fill || (this.isPrivate ? 'off' : 'pro'); // bot fill level
     this.autoStart = !!opts.autoStart;           // offline: start as soon as the creator joins
     this.lobbyTimeout = opts.lobbyTimeout ?? 25; // public lobbies start after this many seconds
-    this.arena = ARENA_VARIANTS[opts.arena] ? opts.arena : 'stadium';
-    if (!this.isPrivate && this.kind !== 'offline' && !ARENA_VARIANTS[this.arena].competitive) this.arena = 'stadium';
+    // game mode (soccar / hoops / dropshot) and an arena that belongs to it
+    this.game = GAME_MODES[opts.game] ? opts.game : (ARENA_VARIANTS[opts.arena]?.mode || 'soccar');
+    const maps = arenasForMode(this.game);
+    const publicPlay = !this.isPrivate && this.kind !== 'offline';
+    const ok = (id) => ARENA_VARIANTS[id] && ARENA_VARIANTS[id].mode === this.game && (!publicPlay || ARENA_VARIANTS[id].competitive);
+    this.arena = ok(opts.arena) ? opts.arena : maps.find((id) => ok(id)) || 'stadium';
     this.arenaParams = ARENA_VARIANTS[this.arena].params;
     this.players = new Map();                    // pid -> player
     this.nextPid = 1;
@@ -2614,7 +2886,7 @@ class MatchHost {
   }
 
   afterJoin(p) {
-    this.out(p.pid, { t: 'welcome', pid: p.pid, token: p.token, code: this.code, mode: this.mode, kind: this.kind, priv: this.isPrivate });
+    this.out(p.pid, { t: 'welcome', pid: p.pid, token: p.token, code: this.code, mode: this.mode, game: this.game, arena: this.arena, kind: this.kind, priv: this.isPrivate });
     this.bumpLobby();
     if (this.world) {
       this.out(p.pid, this.startMsg());
@@ -2732,12 +3004,12 @@ class MatchHost {
     }));
     const left = this.phase === 'lobby' && !this.isPrivate && this.kind !== 'offline'
       ? Math.max(0, this.lobbyTimeout - this.phaseTicks * TICK) : null;
-    return { t: 'lobby', v: this.lobbyVersion, code: this.code, mode: this.mode, phase: this.phase, priv: this.isPrivate, kind: this.kind, owner: this.ownerPid, fill: this.fill, players, startsIn: left };
+    return { t: 'lobby', v: this.lobbyVersion, code: this.code, mode: this.mode, game: this.game, arena: this.arena, phase: this.phase, priv: this.isPrivate, kind: this.kind, owner: this.ownerPid, fill: this.fill, players, startsIn: left };
   }
 
   startMsg() {
     const roster = [...this.players.values()].map((p) => ({ pid: p.pid, name: p.name, team: p.team, bot: !!p.bot, cos: p.cos }));
-    return { t: 'start', mid: this.mid, seed: this.world.seed, mode: this.mode, duration: this.duration, roster, kind: this.kind, arena: this.arena };
+    return { t: 'start', mid: this.mid, seed: this.world.seed, mode: this.mode, duration: this.duration, roster, kind: this.kind, arena: this.arena, game: this.game };
   }
 
   statsMsg() {
@@ -2968,298 +3240,320 @@ return { mergeByMaterial };
 // ---- client/render/arenaMesh.js
 __m["client/render/arenaMesh.js"] = (() => {
 // Builds the visible arena from the same parameters as the collision SDF:
-// a rounded-rectangle bowl with filleted floor/wall/ceiling transitions, two goal boxes with
-// open mouths, floor markings, boost pads and a themed stadium shell around it.
+// the bowl (any rounded convex plan, per-wall fillet radius), the floor and its markings,
+// mode furniture (Soccar goals, Hoops rims/nets/backboards, Dropshot hex tiles) and a themed
+// world around it (stands, light towers, screens, city, water, mountains, dunes, space).
 const THREE = __m["three"];
-const { TEAM_COLORS } = __m["shared/config.js"];
+const { TEAM_COLORS, HOOPS, DROPSHOT, ARENA_VARIANTS } = __m["shared/config.js"];
 const { mergeByMaterial } = __m["client/render/merge.js"];
 
+const V = (id) => ARENA_VARIANTS[id] || {};
+// Each arena variant has a theme with the same id. `sky` is a gradient dome; `surround` lists
+// what is built around the bowl.
 const ARENA_THEMES = {
   stadium: {
-    id: 'stadium', name: 'Overdrive Stadium', blurb: 'Night-time championship bowl. High-contrast, competitive standard.',
-    sky: 0x05070d, fog: 0x070a14, floor: '#1b2f2a', floor2: '#17282a', line: 'rgba(235,245,255,0.85)', wall: [140, 170, 210], wallAlpha: [0.55, 0.10],
-    hemi: [0x9fb8ff, 0x0d0f18, 0.75], sun: [0xffffff, 1.5], crowd: true, accent: 0x7dd3fc, standColor: 0x111827,
+    look: { bloom: 0.85, threshold: 0.9, exposure: 1.25, saturation: 1.15, contrast: 1.06 },
+    name: V('stadium').name, blurb: 'Night-time championship bowl under light towers. The competitive standard.',
+    sky: { top: 0x01030a, horizon: 0x101b3a, bottom: 0x020308 }, fog: 0x0b1328, fogRange: [140, 520],
+    floor: '#1b3a31', floor2: '#18332c', line: 'rgba(235,245,255,0.85)', wall: [140, 175, 220], wallAlpha: [0.6, 0.1],
+    hemi: [0x9fb8ff, 0x0d0f18, 0.75], sun: [0xffffff, 1.6], sunPos: [30, 80, 20], accent: 0x7dd3fc, ground: 0x0a0e16,
+    standColor: 0x151c2c, roofColor: 0x0f1522, surround: ['stands', 'roof', 'towers', 'screens'],
   },
   solstice: {
-    id: 'solstice', name: 'Solstice Park', blurb: 'Open-air afternoon arena. Same competitive geometry, warm light.',
-    sky: 0x9cc7e8, fog: 0xbcd6ea, floor: '#3d7a3a', floor2: '#367134', line: 'rgba(255,255,255,0.9)', wall: [235, 245, 255], wallAlpha: [0.5, 0.06],
-    hemi: [0xdfefff, 0x4a5a3a, 1.0], sun: [0xfff2dd, 2.2], crowd: true, accent: 0xffffff, standColor: 0xc9ced6,
+    look: { bloom: 0.45, threshold: 1.6, exposure: 1.08, saturation: 1.1, contrast: 1.05, vignette: 0.35 },
+    name: V('solstice').name, blurb: 'Open-air afternoon park with tree lines and warm light.',
+    sky: { top: 0x3f8fdc, horizon: 0xd6ebf7, bottom: 0x6d8f5e, sun: [0.45, 0.55, -0.7], sunColor: 0xfff1d6, sunSize: 1 }, fog: 0xc9e0ef, fogRange: [160, 620],
+    floor: '#3f7f3b', floor2: '#397536', line: 'rgba(255,255,255,0.92)', wall: [235, 245, 255], wallAlpha: [0.5, 0.06],
+    hemi: [0xdfefff, 0x4a5a3a, 1.0], sun: [0xfff2dd, 2.3], sunPos: [40, 70, -50], accent: 0xffffff, ground: 0x4c7a3c,
+    standColor: 0xc9ced6, roofColor: 0xe5e7eb, surround: ['stands', 'screens', 'trees'],
+  },
+  harbor: {
+    look: { bloom: 1.1, threshold: 0.75, exposure: 1.3, saturation: 1.22, contrast: 1.1 },
+    name: V('harbor').name, blurb: 'Neon waterfront at night. Skyline, reflections and magenta haze.',
+    sky: { top: 0x05010f, horizon: 0x4a1250, bottom: 0x05020c }, fog: 0x1d0b2c, fogRange: [150, 640],
+    floor: '#161b33', floor2: '#13182d', line: 'rgba(120,240,255,0.95)', wall: [255, 70, 200], wallAlpha: [0.62, 0.12], wallStyle: 'hex',
+    hemi: [0xd6b8ff, 0x10061c, 0.85], sun: [0xc4b5fd, 1.2], sunPos: [-30, 70, 30], accent: 0xff3ea5,
+    standColor: 0x1a1430, roofColor: 0x120d22, tiers: 4, surround: ['stands', 'city', 'water', 'towers'], city: { near: 130, far: 320, hMin: 25, hMax: 130, glow: 0xff9df0 },
+  },
+  frostbite: {
+    look: { bloom: 0.5, threshold: 1.5, exposure: 0.95, saturation: 1.0, contrast: 1.05, vignette: 0.35 },
+    name: V('frostbite').name, blurb: 'Alpine bowl in falling snow, ringed by pines and peaks.',
+    sky: { top: 0x7aa2cf, horizon: 0xe8eff7, bottom: 0xdfe8f0, sun: [-0.3, 0.35, 0.9], sunColor: 0xffffff, sunSize: 0.6 }, fog: 0xdbe6f0, fogRange: [120, 600],
+    floor: '#2f6458', floor2: '#2b5c51', line: 'rgba(255,255,255,0.95)', wall: [210, 235, 255], wallAlpha: [0.55, 0.08],
+    hemi: [0xeaf4ff, 0x5b6b7a, 1.05], sun: [0xf4f8ff, 1.7], sunPos: [-30, 60, 70], accent: 0xbae6fd, ground: 0xe9f0f6,
+    standColor: 0x5b6b7c, roofColor: 0xf1f5f9, surround: ['stands', 'roof', 'mountains', 'pines', 'snow'],
+  },
+  mirage: {
+    look: { bloom: 0.75, threshold: 1.2, exposure: 1.1, saturation: 1.18, contrast: 1.08 },
+    name: V('mirage').name, blurb: 'Desert arena at sunset among dunes and red mesas.',
+    sky: { top: 0x23285e, horizon: 0xff9348, bottom: 0xb86a3a, sun: [0.2, 0.06, -0.98], sunColor: 0xffb070, sunSize: 2.2 }, fog: 0xe9935a, fogRange: [170, 700],
+    floor: '#5d6d2f', floor2: '#56652b', line: 'rgba(255,248,235,0.92)', wall: [255, 205, 150], wallAlpha: [0.55, 0.08],
+    hemi: [0xffd7a8, 0x5a3420, 0.95], sun: [0xffb37a, 2.4], sunPos: [10, 25, -80], accent: 0xffc285, ground: 0xd29a5e,
+    standColor: 0xa9825a, roofColor: 0xc8a174, surround: ['stands', 'dunes', 'mesas'],
   },
   skyway: {
-    id: 'skyway', name: 'Skyway (Experimental)', blurb: 'Casual-only layout: wider, taller, rounder corners. Not used in ranked-style play.',
-    sky: 0x120a1f, fog: 0x1a0f2c, floor: '#24183a', floor2: '#201536', line: 'rgba(240,220,255,0.85)', wall: [190, 150, 255], wallAlpha: [0.5, 0.08],
-    hemi: [0xd9c6ff, 0x120a1f, 0.8], sun: [0xf5e6ff, 1.3], crowd: false, accent: 0xc084fc, standColor: 0x1c1430,
-    params: { width: 80, height: 30, cornerRadius: 22, wallCurve: 6 },
+    look: { bloom: 1.0, threshold: 0.8, exposure: 1.2, saturation: 1.15, contrast: 1.08 },
+    name: V('skyway').name, blurb: 'Casual-only: wider, taller and rounder, floating above the clouds at dusk.',
+    sky: { top: 0x0f0820, horizon: 0x5b2a7a, bottom: 0x1a0f2c }, fog: 0x24123a, fogRange: [150, 650],
+    floor: '#24183a', floor2: '#201536', line: 'rgba(240,220,255,0.88)', wall: [190, 150, 255], wallAlpha: [0.5, 0.08],
+    hemi: [0xd9c6ff, 0x120a1f, 0.85], sun: [0xf5e6ff, 1.3], sunPos: [30, 80, 20], accent: 0xc084fc, surround: ['skyring', 'stars', 'clouds'],
+  },
+  court: {
+    look: { bloom: 0.7, threshold: 1.1, exposure: 1.12, saturation: 1.12, contrast: 1.08 },
+    name: V('court').name, blurb: 'Hoops: indoor-style hardwood court in a city plaza at dusk.',
+    sky: { top: 0x161a3a, horizon: 0xf0875a, bottom: 0x1a1426, sun: [0.6, 0.08, 0.8], sunColor: 0xffa060, sunSize: 1.4 }, fog: 0x5a3a4a, fogRange: [140, 560],
+    floorStyle: 'wood', floor: '#b9824a', floor2: '#ab7742', line: 'rgba(255,255,255,0.95)', wall: [255, 255, 255], wallAlpha: [0.5, 0.07],
+    hemi: [0xffe0c8, 0x2a1c26, 0.95], sun: [0xffc59a, 1.9], sunPos: [50, 40, 60], accent: 0xffa94d, ground: 0x2b2a33,
+    standColor: 0x2a2f3d, roofColor: 0x1c2130, tiers: 4, surround: ['stands', 'city', 'towers'], city: { near: 130, far: 300, hMin: 18, hMax: 85, glow: 0xffd28a },
+  },
+  hexcore: {
+    look: { bloom: 1.2, threshold: 0.75, exposure: 1.25, saturation: 1.2, contrast: 1.1 },
+    name: V('hexcore').name, blurb: 'Dropshot: hexagonal reactor arena in orbit. Break the floor to score.',
+    sky: { top: 0x010108, horizon: 0x0b1a3f, bottom: 0x000004 }, fog: 0x060b1c, fogRange: [180, 700],
+    floor: '#0e1424', floor2: '#0c1120', line: 'rgba(120,220,255,0.8)', wall: [90, 220, 255], wallAlpha: [0.6, 0.1], wallStyle: 'hex',
+    hemi: [0xbfe7ff, 0x05060c, 0.85], sun: [0xe0f2ff, 1.5], sunPos: [-40, 80, 30], accent: 0x5eead4, surround: ['skyring', 'stars', 'planet'],
   },
 };
+for (const [id, t] of Object.entries(ARENA_THEMES)) t.id = id;
 
-// Plan outline of the bowl at a given inset (metres in from the outer wall).
-function planSegments(a, b, Rc, gw) {
-  const ax = a - Rc, bz = b - Rc, segs = [];
-  const line = (xs, zFn, xFn, nx, nz, kind) => segs.push({ type: 'line', xs, zFn, xFn, nx, nz, kind });
-  const linspace = (p, q, step) => { const n = Math.max(1, Math.round(Math.abs(q - p) / step)); const o = []; for (let i = 0; i <= n; i++) o.push(p + (q - p) * i / n); return o; };
-  const concat = (...arrs) => arrs.reduce((acc, r, i) => acc.concat(i ? r.slice(1) : r), []);
-  const endXs = concat(linspace(ax, gw, 1.2), linspace(gw, -gw, 1.0), linspace(-gw, -ax, 1.2));
-  segs.push({ type: 'end', ts: endXs, z: b, nz: 1 });                          // +Z end wall (x from +ax to -ax)
-  segs.push({ type: 'arc', cx: -ax, cz: bz, a0: Math.PI / 2, a1: Math.PI });
-  segs.push({ type: 'side', ts: linspace(bz, -bz, 1.5), x: -a, nx: -1 });       // -X side
-  segs.push({ type: 'arc', cx: -ax, cz: -bz, a0: Math.PI, a1: Math.PI * 1.5 });
-  segs.push({ type: 'end', ts: endXs.slice().reverse(), z: -b, nz: -1 });     // -Z end wall
-  segs.push({ type: 'arc', cx: ax, cz: -bz, a0: Math.PI * 1.5, a1: Math.PI * 2 });
-  segs.push({ type: 'side', ts: linspace(-bz, bz, 1.5), x: a, nx: 1 });         // +X side
-  segs.push({ type: 'arc', cx: ax, cz: bz, a0: 0, a1: Math.PI / 2 });
-  void line;
-  return segs;
+// ------------------------------------------------------------------ textures
+function canvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return [c, c.getContext('2d')]; }
+function tex(c, { repeat = false, srgb = true, aniso = 4 } = {}) {
+  const t = new THREE.CanvasTexture(c);
+  if (repeat) t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = aniso;
+  return t;
 }
 
-// Columns around the perimeter: each column has outer point, outward normal, flags.
-function perimeterColumns(arena) {
-  const p = arena.p;
-  const a = arena.halfW, b = arena.halfL, Rc = p.cornerRadius, gw = arena.goalHalfW;
-  const cols = [];
-  let u = 0, last = null;
-  const push = (x, z, nx, nz, inMouth) => {
-    if (last) u += Math.hypot(x - last.x, z - last.z);
-    const c = { x, z, nx, nz, u, inMouth }; cols.push(c); last = c;
-  };
-  for (const s of planSegments(a, b, Rc, gw)) {
-    if (s.type === 'end') s.ts.forEach((x, i) => { if (cols.length && i === 0) return; push(x, s.z, 0, s.nz, Math.abs(x) <= gw + 1e-6); });
-    else if (s.type === 'side') s.ts.forEach((z, i) => { if (i === 0) return; push(s.x, z, s.nx, 0, false); });
-    else {
-      const n = Math.max(6, Math.round((s.a1 - s.a0) * Rc / 1.2));
-      for (let i = 1; i <= n; i++) {
-        const ang = s.a0 + (s.a1 - s.a0) * i / n;
-        push(s.cx + Rc * Math.cos(ang), s.cz + Rc * Math.sin(ang), Math.cos(ang), Math.sin(ang), false);
-      }
+function wallTexture(theme) {
+  const [c, g] = canvas(256, 256);
+  const [r, gg, b] = theme.wall;
+  g.fillStyle = `rgba(${r},${gg},${b},0.16)`; g.fillRect(0, 0, 256, 256);
+  if (theme.wallStyle === 'hex') {
+    g.strokeStyle = `rgba(${r},${gg},${b},0.7)`; g.lineWidth = 2.5;
+    const R = 32, w = R * Math.sqrt(3);
+    for (let row = -1; row < 6; row++) for (let col = -1; col < 6; col++) {
+      const cx = col * w + (row % 2 ? w / 2 : 0), cy = row * R * 1.5;
+      g.beginPath();
+      for (let i = 0; i < 6; i++) { const a = Math.PI / 6 + (i * Math.PI) / 3; g.lineTo(cx + Math.cos(a) * R, cy + Math.sin(a) * R); }
+      g.closePath(); g.stroke();
+    }
+  } else {
+    g.strokeStyle = `rgba(${r},${gg},${b},0.8)`; g.lineWidth = 3; g.strokeRect(1.5, 1.5, 253, 253);
+    g.strokeStyle = `rgba(${r},${gg},${b},0.22)`; g.lineWidth = 1;
+    for (let i = 32; i < 256; i += 32) { g.beginPath(); g.moveTo(i, 0); g.lineTo(i, 256); g.stroke(); g.beginPath(); g.moveTo(0, i); g.lineTo(256, i); g.stroke(); }
+  }
+  return tex(c, { repeat: true });
+}
+
+function netTexture(color) {
+  const [c, g] = canvas(128, 128);
+  g.strokeStyle = color; g.lineWidth = 2.5; g.globalAlpha = 0.9;
+  for (let i = 0; i <= 128; i += 16) { g.beginPath(); g.moveTo(i, 0); g.lineTo(i - 64, 128); g.stroke(); g.beginPath(); g.moveTo(i, 0); g.lineTo(i + 64, 128); g.stroke(); }
+  return tex(c, { repeat: true });
+}
+
+// ------------------------------------------------------------------ floor markings
+function floorTexture(arena, theme, colors) {
+  const a = arena.halfW, b = arena.halfL;
+  const W = 1024, Hh = Math.round((1024 * b) / a);
+  const [c, g] = canvas(W, Hh);
+  const sx = W / (2 * a), sz = Hh / (2 * b);
+  const X = (x) => (x + a) * sx, Z = (z) => (b - z) * sz; // +z (orange) at the top of the texture
+  const M = (m) => m * sx;
+  const tint = (col, z0, z1, alpha = '30') => { const grd = g.createLinearGradient(0, Z(z0), 0, Z(z1)); grd.addColorStop(0, col + '00'); grd.addColorStop(1, col + alpha); g.fillStyle = grd; g.fillRect(0, Math.min(Z(z0), Z(z1)), W, Math.abs(Z(z1) - Z(z0))); };
+  const circle = (x, z, r, fill) => { g.beginPath(); g.arc(X(x), Z(z), M(r), 0, Math.PI * 2); if (fill) g.fill(); else g.stroke(); };
+
+  if (arena.mode === 'hoops') {
+    // hardwood planks
+    g.fillStyle = theme.floor; g.fillRect(0, 0, W, Hh);
+    const plank = M(0.55);
+    for (let y = 0, k = 0; y < Hh; y += plank, k++) {
+      g.fillStyle = k % 3 === 0 ? theme.floor2 : k % 3 === 1 ? theme.floor : '#b07c45';
+      g.fillRect(0, y, W, plank - 1);
+      g.fillStyle = 'rgba(60,30,10,0.35)'; g.fillRect(0, y + plank - 1, W, 1);
+      for (let x = ((k * 97) % 160) - 160; x < W; x += 160 + ((k * 31) % 60)) g.fillRect(x, y, 1.5, plank);
+    }
+    g.fillStyle = 'rgba(255,240,220,0.06)'; g.fillRect(0, 0, W, Hh);
+    tint(colors[1].css, 0, b, '28'); tint(colors[0].css, 0, -b, '28');
+    g.strokeStyle = theme.line; g.lineWidth = 6;
+    g.beginPath(); g.moveTo(0, Z(0)); g.lineTo(W, Z(0)); g.stroke();
+    circle(0, 0, 7); g.lineWidth = 4; circle(0, 0, 2.5);
+    for (const team of [0, 1]) {
+      const s = team ? 1 : -1, hz = s * arena.hoopZ, col = colors[team].css;
+      // key (painted lane) in team colour
+      const kw = 5.2, kl = 13;
+      g.fillStyle = col + '70';
+      g.fillRect(X(-kw), Math.min(Z(s * b), Z(s * (b - kl))), M(2 * kw), M(kl));
+      g.strokeStyle = theme.line; g.lineWidth = 5;
+      g.strokeRect(X(-kw), Math.min(Z(s * b), Z(s * (b - kl))), M(2 * kw), M(kl));
+      circle(0, s * (b - kl), kw);
+      // three-point arc around the rim
+      g.save(); g.beginPath(); g.rect(0, s > 0 ? 0 : Z(0), W, Hh / 2); g.clip();
+      g.lineWidth = 6; circle(0, hz, 17); g.restore();
+      // hoop shadow ring under the rim
+      g.strokeStyle = col; g.lineWidth = 4; circle(0, hz, HOOPS.rimRadius);
+    }
+  } else if (arena.mode === 'dropshot') {
+    const grd = g.createRadialGradient(W / 2, Hh / 2, 10, W / 2, Hh / 2, Hh * 0.7);
+    grd.addColorStop(0, '#16203a'); grd.addColorStop(1, theme.floor);
+    g.fillStyle = grd; g.fillRect(0, 0, W, Hh);
+    tint(colors[1].css, 0, b, '40'); tint(colors[0].css, 0, -b, '40');
+    // glowing halfway line between the two tile fields
+    const lg = g.createLinearGradient(0, Z(0) - 18, 0, Z(0) + 18);
+    lg.addColorStop(0, 'rgba(120,220,255,0)'); lg.addColorStop(0.5, 'rgba(200,245,255,0.95)'); lg.addColorStop(1, 'rgba(120,220,255,0)');
+    g.fillStyle = lg; g.fillRect(0, Z(0) - 18, W, 36);
+  } else {
+    for (let i = 0; i < 16; i++) { g.fillStyle = i % 2 ? theme.floor : theme.floor2; g.fillRect(0, (Hh / 16) * i, W, Hh / 16 + 1); }
+    // diagonal mowing pattern
+    g.fillStyle = 'rgba(255,255,255,0.025)';
+    for (let i = -Hh; i < W; i += 64) { g.beginPath(); g.moveTo(i, 0); g.lineTo(i + 32, 0); g.lineTo(i + 32 + Hh, Hh); g.lineTo(i + Hh, Hh); g.fill(); }
+    tint(colors[1].css, 0, b); tint(colors[0].css, 0, -b);
+    g.strokeStyle = theme.line; g.lineWidth = 6;
+    g.beginPath(); g.moveTo(0, Z(0)); g.lineTo(W, Z(0)); g.stroke();
+    circle(0, 0, 10);
+    g.fillStyle = theme.line; g.beginPath(); g.arc(X(0), Z(0), 9, 0, Math.PI * 2); g.fill();
+    const gw = arena.goalHalfW;
+    for (const s of [1, -1]) {
+      g.strokeStyle = theme.line; g.lineWidth = 5;
+      g.strokeRect(X(-gw - 4), Math.min(Z(s * b), Z(s * (b - 9))), (2 * gw + 8) * sx, 9 * sz);
+      g.beginPath(); g.arc(X(0), Z(s * (b - 9)), 6 * sx, s > 0 ? 0 : Math.PI, s > 0 ? Math.PI : Math.PI * 2); g.stroke();
+      g.strokeStyle = colors[s > 0 ? 1 : 0].css; g.lineWidth = 10;
+      g.beginPath(); g.moveTo(X(-gw), Z(s * b)); g.lineTo(X(gw), Z(s * b)); g.stroke();
     }
   }
-  return cols;
+  // kickoff spawn markers
+  g.fillStyle = 'rgba(255,255,255,0.5)';
+  for (const team of [0, 1]) for (const sp of arena.kickoffSpawns(team, 5, () => 0)) { g.beginPath(); g.arc(X(sp.pos.x), Z(sp.pos.z), 7, 0, Math.PI * 2); g.fill(); }
+  return tex(c, { aniso: 8 });
 }
 
-// Profile rows from floor fillet, up the wall, through the ceiling fillet: {inset, y}
-function profileRows(arena) {
-  const p = arena.p, r = p.wallCurve, H = p.height, gh = p.goalHeight;
+// ------------------------------------------------------------------ bowl
+// Per-column profile: floor fillet (column's own radius), straight wall rows shared by every
+// column, ceiling fillet. Every column has the same number of rows, so the shell is a grid.
+function profileFor(r, wallYs, H, K) {
   const rows = [];
-  const K = 9;
   for (let i = 0; i <= K; i++) { const th = (Math.PI / 2) * i / K; rows.push({ d: r - r * Math.sin(th), y: r - r * Math.cos(th) }); }
-  const wallYs = [];
-  const n1 = Math.max(1, Math.round((gh - r) / 1.2));
-  for (let i = 1; i <= n1; i++) wallYs.push(r + (gh - r) * i / n1);
-  const n2 = Math.max(1, Math.round((H - r - gh) / 2));
-  for (let i = 1; i <= n2; i++) wallYs.push(gh + (H - r - gh) * i / n2);
   for (const y of wallYs) rows.push({ d: 0, y });
-  for (let i = 1; i <= K; i++) { const th = (Math.PI / 2) * i / K; rows.push({ d: r - r * Math.cos(th), y: H - r + r * Math.sin(th) }); }
+  for (let i = 0; i <= K; i++) { const th = (Math.PI / 2) * i / K; rows.push({ d: r - r * Math.cos(th), y: H - r + r * Math.sin(th) }); }
   let v = 0;
   rows.forEach((row, i) => { if (i) v += Math.hypot(row.d - rows[i - 1].d, row.y - rows[i - 1].y); row.v = v; });
   return rows;
 }
 
-function insetPoint(col, d, Rc, arena) {
-  // offset the outer perimeter point inward along its normal
-  return { x: col.x - col.nx * d, z: col.z - col.nz * d };
-}
-
-function wallTexture(theme) {
-  const c = document.createElement('canvas'); c.width = 256; c.height = 256;
-  const g = c.getContext('2d');
-  const [r, gg, b] = theme.wall;
-  g.clearRect(0, 0, 256, 256);
-  g.fillStyle = `rgba(${r},${gg},${b},0.18)`; g.fillRect(0, 0, 256, 256);
-  g.strokeStyle = `rgba(${r},${gg},${b},0.75)`; g.lineWidth = 3;
-  g.strokeRect(1.5, 1.5, 253, 253);
-  g.strokeStyle = `rgba(${r},${gg},${b},0.25)`; g.lineWidth = 1;
-  for (let i = 32; i < 256; i += 32) { g.beginPath(); g.moveTo(i, 0); g.lineTo(i, 256); g.stroke(); g.beginPath(); g.moveTo(0, i); g.lineTo(256, i); g.stroke(); }
-  const t = new THREE.CanvasTexture(c);
-  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 4; t.colorSpace = THREE.SRGBColorSpace;
-  return t;
-}
-
-function floorTexture(arena, theme, colors) {
-  const a = arena.halfW, b = arena.halfL;
-  const W = 1024, Hh = Math.round(1024 * b / a);
-  const c = document.createElement('canvas'); c.width = W; c.height = Hh;
-  const g = c.getContext('2d');
-  const sx = W / (2 * a), sz = Hh / (2 * b);
-  const X = (x) => (x + a) * sx, Z = (z) => (b - z) * sz; // +z (orange) at top of texture
-  // turf stripes
-  for (let i = 0; i < 16; i++) { g.fillStyle = i % 2 ? theme.floor : theme.floor2; g.fillRect(0, (Hh / 16) * i, W, Hh / 16 + 1); }
-  // team halves tint
-  const tint = (col, z0, z1) => { const grd = g.createLinearGradient(0, Z(z0), 0, Z(z1)); grd.addColorStop(0, col + '00'); grd.addColorStop(1, col + '30'); g.fillStyle = grd; g.fillRect(0, Math.min(Z(z0), Z(z1)), W, Math.abs(Z(z1) - Z(z0))); };
-  tint(colors[1].css, 0, b); tint(colors[0].css, 0, -b);
-  g.strokeStyle = theme.line; g.lineWidth = 6;
-  g.beginPath(); g.moveTo(0, Z(0)); g.lineTo(W, Z(0)); g.stroke();
-  g.beginPath(); g.arc(X(0), Z(0), 10 * sx, 0, Math.PI * 2); g.stroke();
-  g.fillStyle = theme.line; g.beginPath(); g.arc(X(0), Z(0), 9, 0, Math.PI * 2); g.fill();
-  // goal areas
-  const gw = arena.goalHalfW;
-  for (const s of [1, -1]) {
-    g.strokeStyle = theme.line; g.lineWidth = 5;
-    g.strokeRect(X(-gw - 4), Math.min(Z(s * b), Z(s * (b - 9))), (2 * gw + 8) * sx, 9 * sz);
-    g.beginPath(); g.arc(X(0), Z(s * (b - 9)), 6 * sx, s > 0 ? 0 : Math.PI, s > 0 ? Math.PI : Math.PI * 2); g.stroke();
-    // goal line in team colour
-    g.strokeStyle = colors[s > 0 ? 1 : 0].css; g.lineWidth = 10;
-    g.beginPath(); g.moveTo(X(-gw), Z(s * b)); g.lineTo(X(gw), Z(s * b)); g.stroke();
-  }
-  // kickoff spawn markers
-  g.fillStyle = 'rgba(255,255,255,0.55)';
-  for (const team of [0, 1]) for (const sp of arena.kickoffSpawns(team, 5, () => 0)) { g.beginPath(); g.arc(X(sp.pos.x), Z(sp.pos.z), 7, 0, Math.PI * 2); g.fill(); }
-  // pad halos
-  for (const p of arena.pads) {
-    g.fillStyle = p.large ? 'rgba(255,190,60,0.35)' : 'rgba(255,210,120,0.22)';
-    g.beginPath(); g.arc(X(p.x), Z(p.z), p.radius * sx, 0, Math.PI * 2); g.fill();
-  }
-  const t = new THREE.CanvasTexture(c);
-  t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8;
-  return t;
-}
-
-function netTexture(color) {
-  const c = document.createElement('canvas'); c.width = c.height = 128;
-  const g = c.getContext('2d');
-  g.fillStyle = 'rgba(0,0,0,0)'; g.fillRect(0, 0, 128, 128);
-  g.strokeStyle = color; g.lineWidth = 2.5; g.globalAlpha = 0.9;
-  for (let i = 0; i <= 128; i += 16) { g.beginPath(); g.moveTo(i, 0); g.lineTo(i - 64, 128); g.stroke(); g.beginPath(); g.moveTo(i, 0); g.lineTo(i + 64, 128); g.stroke(); }
-  const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace;
-  return t;
-}
-
-function buildArena(arena, themeId = 'stadium', colors = TEAM_COLORS, quality = 'high') {
-  const theme = ARENA_THEMES[themeId] || ARENA_THEMES.stadium;
-  const group = new THREE.Group();
-  const p = arena.p, a = arena.halfW, b = arena.halfL, r = p.wallCurve, H = p.height, Rc = p.cornerRadius, gw = arena.goalHalfW, gh = p.goalHeight;
-
-  // ---------- bowl shell ----------
-  const cols = perimeterColumns(arena);
-  const rows = profileRows(arena);
-  const pos = [], uv = [], idx = [];
-  const NC = cols.length, NR = rows.length;
+function buildBowl(arena, theme, colors) {
+  const p = arena.p, H = p.height, gh = p.goalHeight, gw = arena.goalHalfW;
+  const soccar = arena.mode === 'soccar';
+  const cols = arena.outline(1.2);
+  const NC = cols.length, K = 8;
+  const rMax = Math.max(arena.rSide, arena.rEnd);
+  const lo = rMax, hi = H - rMax;
+  const wallYs = [];
+  const n = Math.max(2, Math.round((hi - lo) / 1.6));
+  for (let k = 1; k < n; k++) wallYs.push(lo + ((hi - lo) * k) / n);
+  if (soccar && gh > lo + 0.05 && gh < hi - 0.05) { wallYs.push(gh); wallYs.sort((x, y) => x - y); }
+  const mouth = (c) => soccar && c.endWall && Math.abs(c.x) <= gw + 1e-6;
+  const profiles = cols.map((c) => profileFor(c.r, wallYs, H, K));
+  const NR = profiles[0].length;
+  let u = 0;
+  const pos = [], uv = [], col = [], idx = [];
   for (let i = 0; i < NC; i++) {
-    for (let j = 0; j < NR; j++) {
-      const pt = insetPoint(cols[i], rows[j].d, Rc, arena);
-      pos.push(pt.x, rows[j].y, pt.z);
-      uv.push(cols[i].u / 6, rows[j].v / 6);
+    const c = cols[i];
+    if (i) u += Math.hypot(c.x - cols[i - 1].x, c.z - cols[i - 1].z);
+    for (const row of profiles[i]) {
+      pos.push(c.x - c.nx * row.d, row.y, c.z - c.nz * row.d);
+      uv.push(u / 6, row.v / 6);
+      const t = Math.min(1, Math.max(0, (row.y - 1) / (H * 0.6)));
+      const a0 = Math.min(0.88, theme.wallAlpha[0] + 0.16), a1 = theme.wallAlpha[1] + 0.1;
+      col.push(1, 1, 1, a0 + (a1 - a0) * t);
     }
   }
   const vtx = (i, j) => (i % NC) * NR + j;
   for (let i = 0; i < NC; i++) {
     const i2 = (i + 1) % NC;
     for (let j = 0; j < NR - 1; j++) {
-      // cut the goal mouth out of the end walls (and the floor fillet in front of it)
-      if (cols[i].inMouth && cols[i2].inMouth && rows[j + 1].y <= gh + 1e-6) continue;
+      // cut the goal mouth (and the floor fillet in front of it) out of the end walls
+      if (mouth(cols[i]) && mouth(cols[i2]) && profiles[i][j + 1].y <= gh + 1e-6) continue;
       idx.push(vtx(i, j), vtx(i2, j), vtx(i, j + 1), vtx(i2, j), vtx(i2, j + 1), vtx(i, j + 1));
     }
   }
-  const shellGeo = new THREE.BufferGeometry();
-  shellGeo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  shellGeo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
-  shellGeo.setIndex(idx);
-  shellGeo.computeVertexNormals();
-  // per-vertex alpha via color attribute (solid low, glassy high)
-  const colAttr = [];
-  for (let i = 0; i < NC; i++) for (let j = 0; j < NR; j++) {
-    const y = rows[j].y, t = Math.min(1, Math.max(0, (y - 1) / (H * 0.6)));
-    const al = theme.wallAlpha[0] + (theme.wallAlpha[1] - theme.wallAlpha[0]) * t;
-    colAttr.push(1, 1, 1, al);
-  }
-  shellGeo.setAttribute('color', new THREE.Float32BufferAttribute(colAttr, 4));
-  const wallTex = wallTexture(theme);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 4));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
   const shellMat = new THREE.MeshStandardMaterial({
-    map: wallTex, transparent: true, vertexColors: true, side: THREE.DoubleSide, roughness: 0.35, metalness: 0.1,
+    map: wallTexture(theme), transparent: true, vertexColors: true, side: THREE.DoubleSide, roughness: 0.35, metalness: 0.1,
     depthWrite: false, emissive: new THREE.Color(theme.accent), emissiveIntensity: 0.06,
   });
-  const shell = new THREE.Mesh(shellGeo, shellMat);
+  // glass reads more solid at grazing angles (fresnel), so walls are clear when driving on them
+  shellMat.onBeforeCompile = (sh) => {
+    sh.fragmentShader = sh.fragmentShader.replace('#include <opaque_fragment>',
+      'float fres = pow(1.0 - abs(dot(normalize(normal), normalize(vViewPosition))), 3.0);\n diffuseColor.a = min(0.96, diffuseColor.a * (1.0 + fres * 2.2) + fres * 0.08);\n #include <opaque_fragment>');
+  };
+  const shell = new THREE.Mesh(geo, shellMat);
   shell.renderOrder = 2;
-  group.add(shell);
 
-  // solid backing for the lower wall band so the bowl reads clearly at speed
-  // (rendered as dark opaque behind the glass to avoid see-through confusion near the floor)
+  // glowing trim where the floor fillet meets the wall, blue at one end fading to orange at the other
+  const trim = (yOf, height, dIn) => {
+    const tp = [], tc = [], ti = [];
+    const cb = new THREE.Color(colors[0].main), co = new THREE.Color(colors[1].main), cw = new THREE.Color(0xffffff), cc = new THREE.Color();
+    for (let i = 0; i <= NC; i++) {
+      const c = cols[i % NC], y0 = yOf(c);
+      tp.push(c.x - c.nx * dIn, y0, c.z - c.nz * dIn, c.x - c.nx * dIn, y0 + height, c.z - c.nz * dIn);
+      const k = Math.max(-1, Math.min(1, c.z / (arena.halfL * 0.7)));
+      cc.copy(cw).multiplyScalar(0.55).lerp(k < 0 ? cb : co, Math.abs(k));
+      tc.push(cc.r, cc.g, cc.b, cc.r, cc.g, cc.b);
+      if (i < NC && !(mouth(c) && mouth(cols[(i + 1) % NC]) && y0 < gh)) ti.push(2 * i, 2 * i + 2, 2 * i + 1, 2 * i + 2, 2 * i + 3, 2 * i + 1);
+    }
+    const tg = new THREE.BufferGeometry();
+    tg.setAttribute('position', new THREE.Float32BufferAttribute(tp, 3));
+    tg.setAttribute('color', new THREE.Float32BufferAttribute(tc, 3));
+    tg.setIndex(ti);
+    return new THREE.Mesh(tg, new THREE.MeshBasicMaterial({ vertexColors: true, color: new THREE.Color(2.2, 2.2, 2.2), side: THREE.DoubleSide, transparent: true, opacity: 0.95, depthWrite: false }));
+  };
+  const trims = [trim((c) => c.r + 0.15, 0.22, 0.03), trim((c) => H - c.r - 0.4, 0.18, 0.03)];
 
-  // ---------- floor ----------
-  const fs = roundedRectShape(a - r, b - r, Rc - r);
-  const floorGeo = new THREE.ShapeGeometry(fs, 24);
-  floorGeo.rotateX(-Math.PI / 2); // shape (x, y) -> (x, 0, -y)
-  const fp = floorGeo.attributes.position, fuv = floorGeo.attributes.uv;
-  for (let i = 0; i < fp.count; i++) fuv.setXY(i, (fp.getX(i) + a) / (2 * a), (fp.getZ(i) + b) / (2 * b));
-  const floorMat = new THREE.MeshStandardMaterial({ map: floorTexture(arena, theme, colors), roughness: 0.85, metalness: 0.0 });
+  // floor polygon: where each fillet starts (or the wall line inside the goal mouth)
+  const shape = new THREE.Shape();
+  const fp = [];
+  for (let i = 0; i < NC; i++) {
+    const c = cols[i], prev = cols[(i + NC - 1) % NC];
+    const inner = soccar && c.endWall && Math.abs(c.x) < gw - 1e-6;
+    const post = soccar && c.endWall && Math.abs(Math.abs(c.x) - gw) < 1e-6;
+    const ptAt = (d) => [c.x - c.nx * d, c.z - c.nz * d];
+    if (post) {
+      const prevIn = prev.endWall && Math.abs(prev.x) < gw - 1e-6;
+      if (prevIn) fp.push(ptAt(0), ptAt(c.r)); else fp.push(ptAt(c.r), ptAt(0));
+    } else fp.push(ptAt(inner ? 0 : c.r));
+  }
+  fp.forEach(([x, z], i) => (i ? shape.lineTo(x, -z) : shape.moveTo(x, -z)));
+  const a = arena.halfW, b = arena.halfL;
+  const floorGeo = new THREE.ShapeGeometry(shape);
+  floorGeo.rotateX(-Math.PI / 2);
+  const fpa = floorGeo.attributes.position, fuv = floorGeo.attributes.uv;
+  for (let i = 0; i < fpa.count; i++) fuv.setXY(i, (fpa.getX(i) + a) / (2 * a), (fpa.getZ(i) + b) / (2 * b));
+  const floorMat = new THREE.MeshStandardMaterial({ map: floorTexture(arena, theme, colors), roughness: arena.mode === 'hoops' ? 0.45 : 0.85, metalness: arena.mode === 'dropshot' ? 0.4 : 0 });
   const floor = new THREE.Mesh(floorGeo, floorMat);
   floor.receiveShadow = true;
-  group.add(floor);
 
-  // ---------- ceiling ----------
-  const ceil = new THREE.Mesh(new THREE.ShapeGeometry(roundedRectShape(a - r, b - r, Rc - r), 12).rotateX(Math.PI / 2).translate(0, H, 0),
+  // ceiling (faint)
+  const cshape = new THREE.Shape();
+  cols.forEach((c, i) => { const x = c.x - c.nx * c.r, z = c.z - c.nz * c.r; if (i) cshape.lineTo(x, -z); else cshape.moveTo(x, -z); });
+  const ceil = new THREE.Mesh(new THREE.ShapeGeometry(cshape).rotateX(-Math.PI / 2).translate(0, H, 0),
     new THREE.MeshBasicMaterial({ color: theme.accent, transparent: true, opacity: 0.035, side: THREE.DoubleSide, depthWrite: false }));
-  group.add(ceil);
 
-  // ---------- goals ----------
-  for (const team of [0, 1]) {
-    const s = team === 0 ? -1 : 1;
-    const col = colors[team];
-    const g = new THREE.Group();
-    const depth = p.goalDepth;
-    const netMat = new THREE.MeshStandardMaterial({ map: netTexture(col.css), transparent: true, side: THREE.DoubleSide, emissive: new THREE.Color(col.main), emissiveIntensity: 0.25, depthWrite: false, roughness: 0.6 });
-    netMat.map.repeat.set(4, 2);
-    const back = new THREE.Mesh(new THREE.PlaneGeometry(2 * gw, gh), netMat); back.position.set(0, gh / 2, s * (b + depth));
-    const roof = new THREE.Mesh(new THREE.PlaneGeometry(2 * gw, depth), netMat); roof.rotation.x = Math.PI / 2; roof.position.set(0, gh, s * (b + depth / 2));
-    const left = new THREE.Mesh(new THREE.PlaneGeometry(depth, gh), netMat); left.rotation.y = Math.PI / 2; left.position.set(-gw, gh / 2, s * (b + depth / 2));
-    const right = left.clone(); right.position.x = gw;
-    const gfloor = new THREE.Mesh(new THREE.PlaneGeometry(2 * gw, depth), new THREE.MeshStandardMaterial({ color: new THREE.Color(col.dark), roughness: 0.8, emissive: new THREE.Color(col.main), emissiveIntensity: 0.08 }));
-    gfloor.rotation.x = -Math.PI / 2; gfloor.position.set(0, 0.005, s * (b + depth / 2));
-    g.add(back, roof, left, right, gfloor);
-    // frame
-    const frameMat = new THREE.MeshStandardMaterial({ color: col.light, emissive: new THREE.Color(col.main), emissiveIntensity: 1.6, roughness: 0.3 });
-    const postGeo = new THREE.CylinderGeometry(0.22, 0.22, gh, 12);
-    for (const x of [-gw, gw]) { const post = new THREE.Mesh(postGeo, frameMat); post.position.set(x, gh / 2, s * b); g.add(post); }
-    const bar = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 2 * gw + 0.44, 12), frameMat); bar.rotation.z = Math.PI / 2; bar.position.set(0, gh, s * b); g.add(bar);
-    // caps for the cut floor fillet beside the posts
-    for (const x of [-gw, gw]) g.add(filletCap(r, x, s * b, s, theme));
-    // team light
-    const light = new THREE.PointLight(col.main, 60, 40, 1.6); light.position.set(0, gh * 0.8, s * (b - 2)); g.add(light);
-    light.userData.dynamic = true;
-    mergeByMaterial(g);
-    group.add(g);
-    // wall glow strip along the end wall (team identity)
-    const strip = new THREE.Mesh(new THREE.PlaneGeometry(2 * (a - Rc) + 6, 0.35), new THREE.MeshBasicMaterial({ color: col.main, transparent: true, opacity: 0.9 }));
-    strip.position.set(0, gh + 1.6, s * (b - 0.02)); strip.rotation.y = s > 0 ? Math.PI : 0; group.add(strip);
-  }
-
-  // ---------- stadium surroundings ----------
-  if (theme.crowd) group.add(buildStands(arena, theme, colors, quality));
-  else group.add(buildSkyRing(arena, theme));
-
-  // ---------- lights ----------
-  const hemi = new THREE.HemisphereLight(theme.hemi[0], theme.hemi[1], theme.hemi[2]);
-  group.add(hemi);
-  const sun = new THREE.DirectionalLight(theme.sun[0], theme.sun[1]);
-  sun.position.set(30, 80, 20);
-  if (quality !== 'low') {
-    sun.castShadow = true;
-    sun.shadow.mapSize.set(quality === 'high' ? 2048 : 1024, quality === 'high' ? 2048 : 1024);
-    const sc = sun.shadow.camera; sc.left = -a - 5; sc.right = a + 5; sc.top = b + 12; sc.bottom = -b - 12; sc.near = 10; sc.far = 160;
-    sun.shadow.bias = -0.0008;
-  }
-  group.add(sun);
-  group.add(sun.target);
-  return { group, theme, floorMat, shellMat };
+  return { shell, shellMat, floor, floorMat, ceil, trims, cols };
 }
 
-function roundedRectShape(hx, hz, rc) {
-  // shape in the (x, y) plane where shape y = -world z after rotateX(-90deg)
-  const s = new THREE.Shape();
-  rc = Math.max(0.01, rc);
-  s.moveTo(-hx + rc, -hz);
-  s.lineTo(hx - rc, -hz); s.absarc(hx - rc, -hz + rc, rc, -Math.PI / 2, 0, false);
-  s.lineTo(hx, hz - rc); s.absarc(hx - rc, hz - rc, rc, 0, Math.PI / 2, false);
-  s.lineTo(-hx + rc, hz); s.absarc(-hx + rc, hz - rc, rc, Math.PI / 2, Math.PI, false);
-  s.lineTo(-hx, -hz + rc); s.absarc(-hx + rc, -hz + rc, rc, Math.PI, Math.PI * 1.5, false);
-  return s;
-}
-
+// ------------------------------------------------------------------ Soccar goals
 function filletCap(r, x, zWall, s, theme) {
-  // cross-section of the solid between floor fillet and wall corner, in the plane x = const
-  const pts = [];
-  const K = 9;
+  // the solid between the back-wall floor fillet and the wall corner, seen side-on at a post
+  const pts = [], K = 9;
   for (let i = 0; i <= K; i++) { const th = (Math.PI / 2) * i / K; pts.push([r - r * Math.sin(th), r - r * Math.cos(th)]); }
-  const verts = [x, 0, zWall]; // corner (inset 0, y 0)
+  const verts = [x, 0, zWall];
   for (const [d, y] of pts) verts.push(x, y, zWall - s * d);
   const idx = [];
   for (let i = 1; i < pts.length; i++) idx.push(0, i, i + 1);
@@ -3269,68 +3563,528 @@ function filletCap(r, x, zWall, s, theme) {
   return new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: new THREE.Color(theme.floor2), side: THREE.DoubleSide, roughness: 0.9 }));
 }
 
-function buildStands(arena, theme, colors, quality) {
+function buildGoals(arena, theme, colors, group) {
+  const p = arena.p, b = arena.halfL, gw = arena.goalHalfW, gh = p.goalHeight, depth = p.goalDepth;
+  const z0 = arena.goalZ0;
+  for (const team of [0, 1]) {
+    const s = team === 0 ? -1 : 1, col = colors[team];
+    const g = new THREE.Group();
+    const netMat = new THREE.MeshStandardMaterial({ map: netTexture(col.css), transparent: true, side: THREE.DoubleSide, emissive: new THREE.Color(col.main), emissiveIntensity: 0.25, depthWrite: false, roughness: 0.6 });
+    netMat.map.repeat.set(4, 2);
+    const back = new THREE.Mesh(new THREE.PlaneGeometry(2 * gw, gh), netMat); back.position.set(0, gh / 2, s * (b + depth));
+    const roof = new THREE.Mesh(new THREE.PlaneGeometry(2 * gw, depth), netMat); roof.rotation.x = Math.PI / 2; roof.position.set(0, gh, s * (b + depth / 2));
+    const left = new THREE.Mesh(new THREE.PlaneGeometry(depth, gh), netMat); left.rotation.y = Math.PI / 2; left.position.set(-gw, gh / 2, s * (b + depth / 2));
+    const right = left.clone(); right.position.x = gw;
+    // goal floor runs from where the back-wall fillet would start, so the mouth is flush
+    const flen = b + depth - z0;
+    const gfloor = new THREE.Mesh(new THREE.PlaneGeometry(2 * gw, flen), new THREE.MeshStandardMaterial({ color: new THREE.Color(col.dark), roughness: 0.8, emissive: new THREE.Color(col.main), emissiveIntensity: 0.1 }));
+    gfloor.rotation.x = -Math.PI / 2; gfloor.position.set(0, 0.004, s * (z0 + flen / 2));
+    g.add(back, roof, left, right, gfloor);
+    const frameMat = new THREE.MeshStandardMaterial({ color: col.light, emissive: new THREE.Color(col.main), emissiveIntensity: 1.6, roughness: 0.3 });
+    const postGeo = new THREE.CylinderGeometry(0.22, 0.22, gh, 12);
+    for (const x of [-gw, gw]) { const post = new THREE.Mesh(postGeo, frameMat); post.position.set(x, gh / 2, s * b); g.add(post); }
+    const bar = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 2 * gw + 0.44, 12), frameMat); bar.rotation.z = Math.PI / 2; bar.position.set(0, gh, s * b); g.add(bar);
+    for (const x of [-gw, gw]) g.add(filletCap(arena.rEnd, x, s * b, s, theme));
+    const light = new THREE.PointLight(col.main, 60, 40, 1.6); light.position.set(0, gh * 0.8, s * (b - 2)); light.userData.dynamic = true; g.add(light);
+    mergeByMaterial(g);
+    group.add(g);
+  }
+}
+
+// ------------------------------------------------------------------ Hoops furniture
+function backboardTexture(col) {
+  const [c, g] = canvas(256, 160);
+  const grd = g.createLinearGradient(0, 0, 0, 160);
+  grd.addColorStop(0, 'rgba(255,255,255,0.28)'); grd.addColorStop(1, 'rgba(255,255,255,0.12)');
+  g.fillStyle = grd; g.fillRect(0, 0, 256, 160);
+  g.strokeStyle = 'rgba(255,255,255,0.95)'; g.lineWidth = 8; g.strokeRect(4, 4, 248, 152);
+  g.strokeStyle = col; g.lineWidth = 7; g.strokeRect(84, 62, 88, 64);
+  return tex(c);
+}
+
+function buildHoops(arena, theme, colors, group) {
+  const b = arena.halfL, rimY = arena.rimY;
+  for (const team of [0, 1]) {
+    const s = team === 0 ? -1 : 1, col = colors[team], z = s * arena.hoopZ;
+    const g = new THREE.Group();
+    const rimMat = new THREE.MeshStandardMaterial({ color: col.light, emissive: new THREE.Color(col.main), emissiveIntensity: 1.3, metalness: 0.6, roughness: 0.3 });
+    const rim = new THREE.Mesh(new THREE.TorusGeometry(arena.rimR, HOOPS.rimTube, 12, 64), rimMat);
+    rim.rotation.x = Math.PI / 2; rim.position.set(0, rimY, z);
+    const netMat = new THREE.MeshStandardMaterial({ map: netTexture('#f8fafc'), transparent: true, side: THREE.DoubleSide, emissive: new THREE.Color(col.main), emissiveIntensity: 0.2, depthWrite: false });
+    netMat.map.repeat.set(10, 2);
+    const net = new THREE.Mesh(new THREE.CylinderGeometry(arena.rimR, arena.rimR * 0.62, HOOPS.netDepth, 32, 3, true), netMat);
+    net.position.set(0, rimY - HOOPS.netDepth / 2, z);
+    // backboard on the back wall and the bracket holding the rim
+    const bw = 2 * arena.rimR + 6, bh = 4.4;
+    const board = new THREE.Mesh(new THREE.PlaneGeometry(bw, bh), new THREE.MeshBasicMaterial({ map: backboardTexture(col.css), transparent: true, side: THREE.DoubleSide, depthWrite: false }));
+    board.position.set(0, rimY + 1.6, s * (b - 0.08)); board.rotation.y = s > 0 ? Math.PI : 0;
+    board.userData.dynamic = true;
+    const blen = b - (arena.hoopZ + arena.rimR);
+    const bracketMat = new THREE.MeshStandardMaterial({ color: 0x9ca3af, metalness: 0.7, roughness: 0.35 });
+    const bracket = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.25, blen + 0.2), bracketMat);
+    bracket.position.set(0, rimY, s * (arena.hoopZ + arena.rimR + blen / 2));
+    // glowing ring on the floor under the hoop
+    const ring = new THREE.Mesh(new THREE.RingGeometry(arena.rimR - 0.25, arena.rimR + 0.05, 48).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: col.main, transparent: true, opacity: 0.55, depthWrite: false }));
+    ring.position.set(0, 0.012, z); ring.userData.dynamic = true;
+    const light = new THREE.PointLight(col.main, 50, 30, 1.6); light.position.set(0, rimY + 3, z - s * 3); light.userData.dynamic = true;
+    g.add(rim, net, board, bracket, ring, light);
+    mergeByMaterial(g);
+    group.add(g);
+  }
+}
+
+// ------------------------------------------------------------------ Dropshot tiles
+function tileTextures() {
+  const S = 256, mid = S / 2;
+  const hexPath = (g, r) => { g.beginPath(); for (let i = 0; i < 6; i++) { const a = Math.PI / 2 + (i * Math.PI) / 3; g.lineTo(mid + Math.cos(a) * r, mid + Math.sin(a) * r); } g.closePath(); };
+  // diffuse: brushed panel, lighter towards the rim
+  const [c1, g1] = canvas(S, S);
+  const rg = g1.createRadialGradient(mid, mid, 10, mid, mid, mid);
+  rg.addColorStop(0, '#6b7280'); rg.addColorStop(0.75, '#9ca3af'); rg.addColorStop(1, '#d1d5db');
+  g1.fillStyle = rg; g1.fillRect(0, 0, S, S);
+  g1.strokeStyle = 'rgba(0,0,0,0.25)'; g1.lineWidth = 3; hexPath(g1, mid * 0.55); g1.stroke();
+  // emissive: bright rim with a soft inner falloff and an inner hex line
+  const [c2, g2] = canvas(S, S);
+  g2.fillStyle = '#000'; g2.fillRect(0, 0, S, S);
+  for (let k = 0; k < 10; k++) { g2.strokeStyle = `rgba(255,255,255,${0.09 * (10 - k) / 10})`; g2.lineWidth = 4; hexPath(g2, mid * 0.98 - k * 4); g2.stroke(); }
+  g2.strokeStyle = '#fff'; g2.lineWidth = 6; hexPath(g2, mid * 0.97); g2.stroke();
+  g2.strokeStyle = 'rgba(255,255,255,0.45)'; g2.lineWidth = 3; hexPath(g2, mid * 0.55); g2.stroke();
+  // hole: black core, glowing edge
+  const [c3, g3] = canvas(S, S);
+  const hg = g3.createRadialGradient(mid, mid, 0, mid, mid, mid);
+  hg.addColorStop(0, '#000'); hg.addColorStop(0.7, '#000'); hg.addColorStop(0.92, '#555'); hg.addColorStop(1, '#fff');
+  g3.fillStyle = hg; g3.fillRect(0, 0, S, S);
+  return { map: tex(c1), glow: tex(c2), hole: tex(c3) };
+}
+
+function buildTiles(arena, colors, group) {
+  const R = DROPSHOT.tileRadius, tiles = arena.tiles, n = tiles.length;
+  const T = tileTextures();
+  const geo = new THREE.CylinderGeometry(R * 0.955, R * 0.955, 0.3, 6, 1, false, Math.PI / 2).translate(0, -0.15 + 0.012, 0);
+  const mat = new THREE.MeshStandardMaterial({ map: T.map, emissive: 0xffffff, emissiveMap: T.glow, emissiveIntensity: 1, roughness: 0.35, metalness: 0.45 });
+  // per-instance colour also tints the glow
+  mat.onBeforeCompile = (sh) => { sh.fragmentShader = sh.fragmentShader.replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n#ifdef USE_COLOR\ntotalEmissiveRadiance *= vColor;\n#endif'); };
+  const mesh = new THREE.InstancedMesh(geo, mat, n);
+  mesh.receiveShadow = true;
+  const holeGeo = new THREE.CircleGeometry(R * 0.955, 6).rotateX(-Math.PI / 2);
+  // CircleGeometry's uv is planar, so a radial texture reads as a dark pit with a lit edge
+  const holes = new THREE.InstancedMesh(holeGeo, new THREE.MeshBasicMaterial({ map: T.hole }), n);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), v = new THREE.Vector3(), s = new THREE.Vector3(), c = new THREE.Color();
+  const intact = colors.map((cl) => new THREE.Color(cl.main).multiplyScalar(0.55));
+  const damaged = colors.map((cl) => new THREE.Color(cl.light).multiplyScalar(1.6));
+  let last = '';
+  const update = (states, t = 0) => {
+    const key = states ? states.join('') : '';
+    if (key === last && !(states && states.includes(1))) return;
+    last = key;
+    for (let i = 0; i < n; i++) {
+      const tl = tiles[i], st = states ? states[i] : 0;
+      m.compose(v.set(tl.x, 0, tl.z), q, s.setScalar(st >= 2 ? 0 : 1)); mesh.setMatrixAt(i, m);
+      if (st === 1) c.copy(damaged[tl.team]).multiplyScalar(0.8 + 0.2 * Math.sin(t * 8 + i)); else c.copy(intact[tl.team]);
+      mesh.setColorAt(i, c);
+      m.compose(v.set(tl.x, 0.014, tl.z), q, s.setScalar(st >= 2 ? 1 : 0)); holes.setMatrixAt(i, m);
+      holes.setColorAt(i, c.set(colors[tl.team].light));
+    }
+    mesh.instanceMatrix.needsUpdate = true; holes.instanceMatrix.needsUpdate = true;
+    mesh.instanceColor.needsUpdate = true; holes.instanceColor.needsUpdate = true;
+  };
+  update(null);
+  group.add(mesh, holes);
+  return update;
+}
+
+// ------------------------------------------------------------------ surroundings
+function skyDome(theme) {
+  const s = theme.sky;
+  const sunDir = new THREE.Vector3(...(s.sun || [0, -1, 0])).normalize();
+  const mat = new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite: false, fog: false,
+    uniforms: {
+      top: { value: new THREE.Color(s.top) }, horizon: { value: new THREE.Color(s.horizon) }, bottom: { value: new THREE.Color(s.bottom) },
+      sunDir: { value: sunDir }, sunColor: { value: new THREE.Color(s.sunColor || 0) }, sunSize: { value: s.sun ? s.sunSize || 1 : 0 },
+    },
+    vertexShader: 'varying vec3 vDir; void main(){ vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: `uniform vec3 top; uniform vec3 horizon; uniform vec3 bottom; uniform vec3 sunDir; uniform vec3 sunColor; uniform float sunSize; varying vec3 vDir;
+      void main(){ vec3 d = normalize(vDir); float h = d.y;
+        vec3 c = h > 0.0 ? mix(horizon, top, pow(smoothstep(0.0, 1.0, h), 0.55)) : mix(horizon, bottom, smoothstep(0.0, 0.2, -h));
+        float s = max(dot(d, sunDir), 0.0);
+        c += sunColor * (step(0.9993, s) * 3.0 * sign(sunSize) + pow(s, 14.0) * 0.4 * sunSize + pow(s, 3.0) * 0.12 * sunSize);
+        gl_FragColor = vec4(c, 1.0);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }`,
+  });
+  const m = new THREE.Mesh(new THREE.SphereGeometry(800, 48, 24), mat);
+  m.renderOrder = -10; m.frustumCulled = false; m.userData.dynamic = true;
+  return m;
+}
+
+// outer plan edges with outward normals (for stands, boards, screens)
+function planEdges(arena) {
+  const o = arena.outer, out = [];
+  for (let i = 0; i < o.length; i++) {
+    const [ax, az] = o[i], [bx, bz] = o[(i + 1) % o.length];
+    const ex = bx - ax, ez = bz - az, len = Math.hypot(ex, ez);
+    out.push({ mx: (ax + bx) / 2, mz: (az + bz) / 2, len, nx: ez / len, nz: -ex / len, end: Math.abs(-ex / len) > 0.99 });
+  }
+  return out;
+}
+
+function ledTexture(colors, text) {
+  const [c, g] = canvas(512, 64);
+  const grd = g.createLinearGradient(0, 0, 512, 0);
+  grd.addColorStop(0, colors[0].css); grd.addColorStop(0.5, '#0b1020'); grd.addColorStop(1, colors[1].css);
+  g.fillStyle = grd; g.fillRect(0, 0, 512, 64);
+  g.fillStyle = 'rgba(255,255,255,0.92)'; g.font = 'italic 700 34px "Chakra Petch", system-ui, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(text, 256, 34);
+  g.fillStyle = 'rgba(0,0,0,0.25)'; for (let y = 0; y < 64; y += 3) g.fillRect(0, y, 512, 1);
+  return tex(c, { repeat: true });
+}
+
+function screenTexture(name, colors) {
+  const [c, g] = canvas(512, 192);
+  const grd = g.createLinearGradient(0, 0, 512, 192);
+  grd.addColorStop(0, '#050816'); grd.addColorStop(1, '#141c36');
+  g.fillStyle = grd; g.fillRect(0, 0, 512, 192);
+  g.fillStyle = colors[0].css; g.fillRect(0, 0, 256, 10); g.fillStyle = colors[1].css; g.fillRect(256, 0, 256, 10);
+  g.fillStyle = '#f8fafc'; g.font = 'italic 800 56px "Chakra Petch", system-ui, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText('OVERDRIVE', 256, 88);
+  g.fillStyle = 'rgba(203,213,225,0.85)'; g.font = '600 24px "Chakra Petch", system-ui, sans-serif'; g.fillText(name.toUpperCase(), 256, 146);
+  return tex(c);
+}
+
+function buildStands(arena, theme, colors, quality, group) {
   const g = new THREE.Group();
-  const a = arena.halfW, b = arena.halfL, H = arena.p.height;
-  const standMat = new THREE.MeshStandardMaterial({ color: theme.standColor, roughness: 0.9 });
-  const tiers = 7;
-  const crowdPositions = [];
-  const sides = [
-    { len: 2 * b, cx: a + 4, cz: 0, rot: 0 }, { len: 2 * b, cx: -a - 4, cz: 0, rot: Math.PI },
-    { len: 2 * a, cx: 0, cz: b + arena.p.goalDepth + 4, rot: -Math.PI / 2 }, { len: 2 * a, cx: 0, cz: -b - arena.p.goalDepth - 4, rot: Math.PI / 2 },
-  ];
-  for (const sd of sides) {
+  const H = arena.p.height, tiers = theme.tiers || 7;
+  const standMat = new THREE.MeshStandardMaterial({ color: theme.standColor, roughness: 0.85 });
+  const edgeMat = new THREE.MeshStandardMaterial({ color: theme.standColor, emissive: new THREE.Color(theme.accent), emissiveIntensity: 0.35, roughness: 0.6 });
+  const led = new THREE.MeshBasicMaterial({ map: ledTexture(colors, 'OVERDRIVE  ·  OVERDRIVE') });
+  const crowd = [];
+  for (const e of planEdges(arena)) {
+    const d0 = 3.5 + (arena.mode === 'soccar' && e.end ? arena.p.goalDepth : 0);
+    const len = e.len + 14;
     const grp = new THREE.Group();
     for (let t = 0; t < tiers; t++) {
-      const step = new THREE.Mesh(new THREE.BoxGeometry(3, 1.6, sd.len + 10), standMat);
-      step.position.set(t * 3, 1 + t * 2.4, 0); grp.add(step);
-      for (let k = -sd.len / 2; k < sd.len / 2; k += 1.4) crowdPositions.push({ grp, x: t * 3 - 0.3, y: 2.6 + t * 2.4, z: k + (Math.random() - 0.5) * 0.4, side: sd });
+      const step = new THREE.Mesh(new THREE.BoxGeometry(3, 1.6, len + t * 3), standMat);
+      step.position.set(d0 + 1.5 + t * 3, 0.8 + t * 2.4, 0); grp.add(step);
+      const lip = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.12, len + t * 3), edgeMat);
+      lip.position.set(d0 + t * 3 + 0.05, 1.62 + t * 2.4, 0); grp.add(lip);
+      for (let k = -len / 2 + 1; k < len / 2 - 1; k += 1.4) crowd.push({ grp, x: d0 + 1.2 + t * 3, y: 2.2 + t * 2.4, z: k + (Math.random() - 0.5) * 0.4 });
     }
-    grp.position.set(sd.cx, 0, sd.cz); grp.rotation.y = sd.rot;
+    // LED advertising board in front of the first tier
+    const board = new THREE.Mesh(new THREE.PlaneGeometry(len, 1.1), led.clone());
+    board.material.map = led.map.clone(); board.material.map.repeat.set(Math.max(1, Math.round(len / 18)), 1); board.material.map.needsUpdate = true;
+    board.position.set(d0 - 0.05, 0.75, 0); board.rotation.y = -Math.PI / 2; board.userData.dynamic = true;
+    grp.add(board);
+    if (theme.surround.includes('roof')) {
+      const roof = new THREE.Mesh(new THREE.BoxGeometry(tiers * 3 + 6, 0.5, len + tiers * 3), new THREE.MeshStandardMaterial({ color: theme.roofColor, roughness: 0.7 }));
+      roof.position.set(d0 + tiers * 1.5 + 1, tiers * 2.4 + 7, 0); roof.rotation.z = 0.12; grp.add(roof);
+      const strip = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.2, len + tiers * 3), new THREE.MeshBasicMaterial({ color: 0xf8fafc }));
+      strip.position.set(d0 - 1.5, tiers * 2.4 + 6.3, 0); grp.add(strip);
+    }
+    grp.position.set(e.mx, 0, e.mz); grp.rotation.y = Math.atan2(-e.nz, e.nx);
     g.add(grp);
   }
-  // crowd as one instanced mesh
-  const n = quality === 'low' ? Math.floor(crowdPositions.length / 3) : crowdPositions.length;
-  const crowd = new THREE.InstancedMesh(new THREE.BoxGeometry(0.6, 1.1, 0.6), new THREE.MeshStandardMaterial({ roughness: 1 }), n);
-  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), sc = new THREE.Vector3(1, 1, 1), v = new THREE.Vector3(), c = new THREE.Color();
-  const palette = [0xe5e7eb, 0x9ca3af, 0x374151, colors[0].main, colors[1].main, colors[0].light, colors[1].light];
+  // crowd as one instanced mesh, fans lean towards the team at their end
+  const n = quality === 'low' ? Math.floor(crowd.length / 3) : crowd.length;
+  const inst = new THREE.InstancedMesh(new THREE.BoxGeometry(0.6, 1.1, 0.6), new THREE.MeshStandardMaterial({ roughness: 1 }), n);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), sc = new THREE.Vector3(), v = new THREE.Vector3(), c = new THREE.Color();
+  const palette = [0xe5e7eb, 0x9ca3af, 0x374151];
+  g.updateMatrixWorld(true);
   for (let i = 0; i < n; i++) {
-    const cp = crowdPositions[Math.floor(i * crowdPositions.length / n)];
-    v.set(cp.x, cp.y, cp.z).applyAxisAngle(new THREE.Vector3(0, 1, 0), cp.side.rot).add(new THREE.Vector3(cp.side.cx, 0, cp.side.cz));
+    const cp = crowd[Math.floor((i * crowd.length) / n)];
+    v.set(cp.x, cp.y, cp.z).applyMatrix4(cp.grp.matrixWorld);
     sc.set(1, 0.8 + Math.random() * 0.4, 1);
-    m.compose(v, q, sc);
-    crowd.setMatrixAt(i, m);
-    // fans lean towards the team at their end
+    m.compose(v, q, sc); inst.setMatrixAt(i, m);
     const zside = v.z > 10 ? 1 : v.z < -10 ? 0 : -1;
     let col = palette[Math.floor(Math.random() * 3)];
     if (zside >= 0 && Math.random() < 0.6) col = Math.random() < 0.5 ? colors[zside].main : colors[zside].light;
-    crowd.setColorAt(i, c.set(col));
-  }
-  crowd.instanceMatrix.needsUpdate = true;
-  g.add(crowd);
-  mergeByMaterial(g, { receiveShadow: false });
-  // light rigs
-  const rigMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-  for (const x of [-a - 8, a + 8]) for (const z of [-b + 10, 0, b - 10]) {
-    const rig = new THREE.Mesh(new THREE.BoxGeometry(1, 0.4, 4), rigMat); rig.position.set(x, H + 8, z); g.add(rig);
+    inst.setColorAt(i, c.set(col));
   }
   mergeByMaterial(g);
-  return g;
+  g.add(inst);
+  group.add(g);
+  void H;
 }
 
-function buildSkyRing(arena, theme) {
+function buildTowers(arena, theme, group) {
   const g = new THREE.Group();
-  const geo = new THREE.TorusGeometry(Math.max(arena.halfW, arena.halfL) + 30, 0.6, 8, 120);
-  const ring = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: theme.accent }));
+  const H = arena.p.height;
+  const poleMat = new THREE.MeshStandardMaterial({ color: 0x374151, metalness: 0.6, roughness: 0.4 });
+  const headMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(0xffffff).multiplyScalar(4) });
+  for (const [sx, sz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+    const x = sx * (arena.halfW + 24), z = sz * (arena.halfL * 0.8 + 20);
+    const hgt = H + 34;
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.9, hgt, 8), poleMat); pole.position.set(x, hgt / 2, z); g.add(pole);
+    const head = new THREE.Group(); head.position.set(x, hgt, z); head.lookAt(0, 0, 0);
+    const panel = new THREE.Mesh(new THREE.BoxGeometry(7, 4, 0.5), headMat); head.add(panel);
+    const back = new THREE.Mesh(new THREE.BoxGeometry(7.4, 4.4, 0.6), poleMat); back.position.z = -0.4; head.add(back);
+    g.add(head);
+  }
+  mergeByMaterial(g);
+  group.add(g);
+}
+
+function buildScreens(arena, theme, colors, group) {
+  const H = arena.p.height;
+  const mat = new THREE.MeshBasicMaterial({ map: screenTexture(theme.name, colors) });
+  const frame = new THREE.MeshStandardMaterial({ color: 0x1f2937, metalness: 0.5, roughness: 0.4 });
+  for (const s of [-1, 1]) {
+    const z = s * (arena.halfL + (arena.mode === 'soccar' ? arena.p.goalDepth : 0) + 18);
+    const scr = new THREE.Mesh(new THREE.PlaneGeometry(26, 9.75), mat); scr.position.set(0, H + 12, z); scr.lookAt(0, H + 4, 0);
+    const fr = new THREE.Mesh(new THREE.BoxGeometry(27, 10.6, 0.6), frame); fr.position.copy(scr.position); fr.quaternion.copy(scr.quaternion); fr.translateZ(-0.35);
+    group.add(scr, fr);
+  }
+}
+
+function rand(seed) { let s = seed >>> 0; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+
+function buildCity(arena, theme, quality, group) {
+  const cfg = theme.city || { near: 100, far: 240, hMin: 25, hMax: 110, glow: 0xffd28a };
+  const [c, g] = canvas(64, 128);
+  g.fillStyle = '#05070d'; g.fillRect(0, 0, 64, 128);
+  const r = rand(7);
+  for (let y = 2; y < 128; y += 6) for (let x = 2; x < 64; x += 6) if (r() < 0.45) { g.fillStyle = r() < 0.75 ? '#ffd9a0' : '#9be7ff'; g.globalAlpha = 0.5 + r() * 0.5; g.fillRect(x, y, 3, 3); }
+  g.globalAlpha = 1;
+  const t = tex(c, { repeat: true }); t.repeat.set(2, 3);
+  const mat = new THREE.MeshStandardMaterial({ color: 0x1c2230, map: t, emissive: new THREE.Color(cfg.glow), emissiveMap: t, emissiveIntensity: 1.1, roughness: 0.6, metalness: 0.3 });
+  const n = quality === 'low' ? 70 : 190;
+  const inst = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0), mat, n);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), v = new THREE.Vector3(), s = new THREE.Vector3();
+  for (let i = 0; i < n; i++) {
+    const ang = (i / n) * Math.PI * 2 + r() * 0.05, d = cfg.near + r() * (cfg.far - cfg.near);
+    const h = cfg.hMin + Math.pow(r(), 1.6) * (cfg.hMax - cfg.hMin);
+    q.setFromAxisAngle(v.set(0, 1, 0), ang);
+    m.compose(v.set(Math.sin(ang) * d, -6, Math.cos(ang) * d), q, s.set(8 + r() * 16, h, 8 + r() * 16));
+    inst.setMatrixAt(i, m);
+  }
+  group.add(inst);
+  // rooftop beacons
+  const bp = [];
+  for (let i = 0; i < 40; i++) { const ang = r() * Math.PI * 2, d = cfg.near + r() * (cfg.far - cfg.near); bp.push(Math.sin(ang) * d, cfg.hMin + r() * (cfg.hMax - cfg.hMin), Math.cos(ang) * d); }
+  const bg = new THREE.BufferGeometry(); bg.setAttribute('position', new THREE.Float32BufferAttribute(bp, 3));
+  group.add(new THREE.Points(bg, new THREE.PointsMaterial({ color: 0xff4d6d, size: 3, sizeAttenuation: false })));
+}
+
+function buildGround(theme, group, y = -0.06) {
+  const g = new THREE.Mesh(new THREE.CircleGeometry(900, 64).rotateX(-Math.PI / 2), new THREE.MeshStandardMaterial({ color: theme.ground, roughness: 0.95 }));
+  g.position.y = y; g.receiveShadow = true;
+  group.add(g);
+}
+
+function buildWater(group) {
+  const w = new THREE.Mesh(new THREE.CircleGeometry(900, 64).rotateX(-Math.PI / 2), new THREE.MeshStandardMaterial({ color: 0x070a1c, roughness: 0.06, metalness: 0.95 }));
+  w.position.y = -3;
+  group.add(w);
+  // deck around the arena
+  const deck = new THREE.Mesh(new THREE.CircleGeometry(95, 48).rotateX(-Math.PI / 2), new THREE.MeshStandardMaterial({ color: 0x141827, roughness: 0.8 }));
+  deck.position.y = -0.08; group.add(deck);
+  const edge = new THREE.Mesh(new THREE.TorusGeometry(95, 0.25, 6, 96).rotateX(Math.PI / 2), new THREE.MeshBasicMaterial({ color: 0x22d3ee }));
+  edge.position.y = -0.05; group.add(edge);
+}
+
+function buildMountains(quality, group) {
+  const r = rand(11);
+  const rock = new THREE.MeshStandardMaterial({ color: 0x6b7a8c, roughness: 1, flatShading: true });
+  const snow = new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 0.9, flatShading: true });
+  const g = new THREE.Group();
+  for (let i = 0; i < 26; i++) {
+    const ang = (i / 26) * Math.PI * 2 + r() * 0.2, d = 300 + r() * 120, h = 90 + r() * 140, rad = 60 + r() * 60;
+    const seg = 5 + Math.floor(r() * 3);
+    const m = new THREE.Mesh(new THREE.ConeGeometry(rad, h, seg), rock); m.position.set(Math.sin(ang) * d, h / 2 - 4, Math.cos(ang) * d); m.rotation.y = r() * 3;
+    const cap = new THREE.Mesh(new THREE.ConeGeometry(rad * 0.36, h * 0.36, seg), snow); cap.position.copy(m.position); cap.position.y = h - 4 - h * 0.18; cap.rotation.y = m.rotation.y;
+    g.add(m, cap);
+  }
+  mergeByMaterial(g);
+  group.add(g);
+  void quality;
+}
+
+function buildPines(quality, group, near = 70, far = 170, color = 0x284238) {
+  const r = rand(5);
+  const n = quality === 'low' ? 90 : 260;
+  const inst = new THREE.InstancedMesh(new THREE.ConeGeometry(3, 12, 7).translate(0, 6, 0), new THREE.MeshStandardMaterial({ color, roughness: 1, flatShading: true }), n);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), v = new THREE.Vector3(), s = new THREE.Vector3();
+  for (let i = 0; i < n; i++) {
+    const ang = r() * Math.PI * 2, d = near + r() * (far - near), k = 0.7 + r() * 0.9;
+    m.compose(v.set(Math.sin(ang) * d, -0.1, Math.cos(ang) * d), q, s.set(k, k * (0.9 + r() * 0.5), k)); inst.setMatrixAt(i, m);
+  }
+  group.add(inst);
+}
+
+function buildTrees(quality, group) {
+  const r = rand(9);
+  const n = quality === 'low' ? 70 : 200;
+  const crowns = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(4, 0).translate(0, 8, 0), new THREE.MeshStandardMaterial({ color: 0x3b7a35, roughness: 1, flatShading: true }), n);
+  const trunks = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.4, 0.6, 6, 6).translate(0, 3, 0), new THREE.MeshStandardMaterial({ color: 0x5b4030, roughness: 1 }), n);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), v = new THREE.Vector3(), s = new THREE.Vector3(), c = new THREE.Color();
+  for (let i = 0; i < n; i++) {
+    const ang = r() * Math.PI * 2, d = 85 + r() * 110, k = 0.8 + r() * 0.8;
+    m.compose(v.set(Math.sin(ang) * d, -0.1, Math.cos(ang) * d), q, s.setScalar(k));
+    crowns.setMatrixAt(i, m); trunks.setMatrixAt(i, m);
+    crowns.setColorAt(i, c.setHSL(0.27 + r() * 0.06, 0.45, 0.28 + r() * 0.1));
+  }
+  group.add(crowns, trunks);
+}
+
+function buildDunes(group) {
+  const geo = new THREE.PlaneGeometry(1600, 1600, 160, 160).rotateX(-Math.PI / 2);
+  const p = geo.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), z = p.getZ(i), d = Math.hypot(x, z);
+    const k = Math.min(1, Math.max(0, (d - 90) / 80));
+    const h = (Math.sin(x * 0.021 + Math.cos(z * 0.013) * 2) * 9 + Math.sin(z * 0.033 + x * 0.008) * 5 + Math.sin((x + z) * 0.06) * 1.5 + 8) * k;
+    p.setY(i, h - 0.1);
+  }
+  geo.computeVertexNormals();
+  group.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0xd59a5c, roughness: 1 })));
+}
+
+function buildMesas(group) {
+  const r = rand(3);
+  const g = new THREE.Group();
+  const mat = new THREE.MeshStandardMaterial({ color: 0xa4552f, roughness: 1, flatShading: true });
+  const top = new THREE.MeshStandardMaterial({ color: 0xc77a45, roughness: 1, flatShading: true });
+  for (let i = 0; i < 12; i++) {
+    const ang = r() * Math.PI * 2, d = 330 + r() * 160, h = 40 + r() * 60, rad = 25 + r() * 40;
+    const m = new THREE.Mesh(new THREE.CylinderGeometry(rad * 0.8, rad, h, 7), mat); m.position.set(Math.sin(ang) * d, h / 2, Math.cos(ang) * d);
+    const cap = new THREE.Mesh(new THREE.CylinderGeometry(rad * 0.82, rad * 0.8, 3, 7), top); cap.position.copy(m.position); cap.position.y = h + 1.5;
+    g.add(m, cap);
+  }
+  mergeByMaterial(g);
+  group.add(g);
+}
+
+function buildSkyRing(arena, theme, group) {
+  const R = Math.max(arena.halfW, arena.halfL) + 30;
+  const mat = new THREE.MeshBasicMaterial({ color: theme.accent });
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(R, 0.6, 8, 160), mat);
   ring.rotation.x = Math.PI / 2; ring.position.y = arena.p.height + 6;
-  g.add(ring);
-  const ring2 = ring.clone(); ring2.scale.setScalar(1.15); ring2.position.y = -2; g.add(ring2);
-  const stars = new THREE.BufferGeometry();
+  const ring2 = ring.clone(); ring2.scale.setScalar(1.15); ring2.position.y = -2;
+  // underside platform so the arena reads as floating
+  const plat = new THREE.Mesh(new THREE.CylinderGeometry(R - 8, R * 0.4, 18, 48, 1), new THREE.MeshStandardMaterial({ color: 0x1b1530, roughness: 0.7, metalness: 0.4 }));
+  plat.position.y = -9.2;
+  group.add(ring, ring2, plat);
+}
+
+function buildStars(group) {
   const sp = [];
-  for (let i = 0; i < 1500; i++) { const th = Math.random() * Math.PI * 2, ph = Math.random() * Math.PI * 0.45; const R = 260; sp.push(R * Math.cos(th) * Math.sin(ph), R * Math.cos(ph) - 40, R * Math.sin(th) * Math.sin(ph)); }
-  stars.setAttribute('position', new THREE.Float32BufferAttribute(sp, 3));
-  g.add(new THREE.Points(stars, new THREE.PointsMaterial({ color: 0xffffff, size: 1.2, sizeAttenuation: false })));
-  return g;
+  const r = rand(17);
+  for (let i = 0; i < 2200; i++) { const th = r() * Math.PI * 2, ph = r() * Math.PI * 0.62; const R = 700; sp.push(R * Math.cos(th) * Math.sin(ph), R * Math.cos(ph) - 60, R * Math.sin(th) * Math.sin(ph)); }
+  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(sp, 3));
+  const pts = new THREE.Points(geo, new THREE.PointsMaterial({ color: 0xffffff, size: 1.3, sizeAttenuation: false, fog: false }));
+  group.add(pts);
+}
+
+function buildPlanet(group) {
+  const pl = new THREE.Mesh(new THREE.SphereGeometry(140, 48, 24), new THREE.MeshStandardMaterial({ color: 0x2b6cb0, emissive: 0x0b2a55, emissiveIntensity: 0.6, roughness: 0.8, fog: false }));
+  pl.position.set(-380, 160, -520);
+  const ring = new THREE.Mesh(new THREE.RingGeometry(180, 260, 96), new THREE.MeshBasicMaterial({ color: 0x93c5fd, transparent: true, opacity: 0.35, side: THREE.DoubleSide, fog: false }));
+  ring.position.copy(pl.position); ring.rotation.x = 1.2; ring.rotation.y = 0.3;
+  group.add(pl, ring);
+}
+
+function buildClouds(group) {
+  const r = rand(21);
+  const inst = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(10, 1), new THREE.MeshStandardMaterial({ color: 0xc4b5fd, roughness: 1, transparent: true, opacity: 0.55, flatShading: true }), 90);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), v = new THREE.Vector3(), s = new THREE.Vector3();
+  for (let i = 0; i < 90; i++) {
+    const ang = r() * Math.PI * 2, d = 120 + r() * 380;
+    m.compose(v.set(Math.sin(ang) * d, -40 - r() * 30, Math.cos(ang) * d), q, s.set(2 + r() * 3, 0.6 + r() * 0.5, 2 + r() * 3)); inst.setMatrixAt(i, m);
+  }
+  group.add(inst);
+}
+
+function buildSnow(quality) {
+  const n = quality === 'low' ? 600 : 1800;
+  const pos = new Float32Array(n * 3);
+  const r = rand(31);
+  for (let i = 0; i < n; i++) { pos[i * 3] = (r() - 0.5) * 220; pos[i * 3 + 1] = r() * 70; pos[i * 3 + 2] = (r() - 0.5) * 220; }
+  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const pts = new THREE.Points(geo, new THREE.PointsMaterial({ color: 0xffffff, size: 0.28, transparent: true, opacity: 0.85, depthWrite: false }));
+  pts.frustumCulled = false;
+  const update = (dt, t) => {
+    for (let i = 0; i < n; i++) {
+      let y = pos[i * 3 + 1] - dt * (2.2 + (i % 7) * 0.25);
+      if (y < 0) y += 70;
+      pos[i * 3 + 1] = y;
+      pos[i * 3] += Math.sin(t * 0.7 + i) * dt * 0.6;
+    }
+    geo.attributes.position.needsUpdate = true;
+  };
+  return { pts, update };
+}
+
+// ------------------------------------------------------------------ assembly
+function buildArena(arena, themeId = 'stadium', colors = TEAM_COLORS, quality = 'high') {
+  const theme = ARENA_THEMES[themeId] || ARENA_THEMES.stadium;
+  const group = new THREE.Group();
+  const H = arena.p.height, a = arena.halfW, b = arena.halfL;
+  const updaters = [];
+
+  const bowl = buildBowl(arena, theme, colors);
+  group.add(bowl.shell, bowl.floor, bowl.ceil, ...bowl.trims);
+
+  if (arena.mode === 'soccar') buildGoals(arena, theme, colors, group);
+  else if (arena.mode === 'hoops') buildHoops(arena, theme, colors, group);
+  let setTiles = null;
+  if (arena.mode === 'dropshot') setTiles = buildTiles(arena, colors, group);
+
+  // team-coloured light strip along each end wall
+  for (const team of [0, 1]) {
+    const s = team ? 1 : -1;
+    const xs = bowl.cols.filter((c) => c.endWall && c.z * s > 0).map((c) => Math.abs(c.x));
+    const half = xs.length ? Math.max(...xs) : a - arena.Rc;
+    const y = arena.mode === 'soccar' ? arena.p.goalHeight + 1.6 : arena.mode === 'hoops' ? arena.rimY + 4.6 : H * 0.45;
+    const strip = new THREE.Mesh(new THREE.PlaneGeometry(2 * half, 0.35), new THREE.MeshBasicMaterial({ color: colors[team].main, transparent: true, opacity: 0.9 }));
+    strip.position.set(0, y, s * (b - 0.03)); strip.rotation.y = s > 0 ? Math.PI : 0;
+    group.add(strip);
+  }
+
+  // world around the bowl
+  const world = new THREE.Group();
+  world.add(skyDome(theme));
+  const sur = theme.surround;
+  if (sur.includes('stands')) buildStands(arena, theme, colors, quality, world);
+  if (sur.includes('towers')) buildTowers(arena, theme, world);
+  if (sur.includes('screens')) buildScreens(arena, theme, colors, world);
+  if (sur.includes('water')) buildWater(world);
+  else if (sur.includes('dunes')) buildDunes(world);
+  else if (theme.ground !== undefined) buildGround(theme, world);
+  if (sur.includes('city')) buildCity(arena, theme, quality, world);
+  if (sur.includes('mountains')) buildMountains(quality, world);
+  if (sur.includes('pines')) buildPines(quality, world);
+  if (sur.includes('trees')) buildTrees(quality, world);
+  if (sur.includes('mesas')) buildMesas(world);
+  if (sur.includes('skyring')) buildSkyRing(arena, theme, world);
+  if (sur.includes('stars')) buildStars(world);
+  if (sur.includes('planet')) buildPlanet(world);
+  if (sur.includes('clouds')) buildClouds(world);
+  if (sur.includes('snow')) { const sn = buildSnow(quality); world.add(sn.pts); updaters.push(sn.update); }
+  group.add(world);
+
+  // lights
+  const hemi = new THREE.HemisphereLight(theme.hemi[0], theme.hemi[1], theme.hemi[2]);
+  group.add(hemi);
+  const sun = new THREE.DirectionalLight(theme.sun[0], theme.sun[1]);
+  sun.position.set(...(theme.sunPos || [30, 80, 20]));
+  if (quality !== 'low') {
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(quality === 'high' ? 2048 : 1024, quality === 'high' ? 2048 : 1024);
+    const sc = sun.shadow.camera; const ext = Math.max(a, b) + 14;
+    sc.left = -ext; sc.right = ext; sc.top = ext; sc.bottom = -ext; sc.near = 1; sc.far = 260;
+    sun.shadow.bias = -0.0008;
+  }
+  // keep the shadow frustum centred on the pitch even for low sun angles
+  const sp = new THREE.Vector3(...(theme.sunPos || [30, 80, 20])).normalize().multiplyScalar(120);
+  sun.position.copy(sp);
+  group.add(sun, sun.target);
+
+  return {
+    group, theme, floorMat: bowl.floorMat, shellMat: bowl.shellMat,
+    setTiles,
+    update(dt, t) { for (const f of updaters) f(dt, t); },
+  };
 }
 
 return { ARENA_THEMES, buildArena };
@@ -4052,7 +4806,7 @@ __m["client/camera.js"] = (() => {
 // smooth mode transitions, optional impact shake, and a cinematic replay mode.
 const THREE = __m["three"];
 
-const _v = new THREE.Vector3(), _u = new THREE.Vector3(), _f = new THREE.Vector3(), _t = new THREE.Vector3();
+const _v = new THREE.Vector3(), _u = new THREE.Vector3(), _f = new THREE.Vector3(), _t = new THREE.Vector3(), _w = new THREE.Vector3(), _m = new THREE.Vector3();
 
 class CameraRig {
   constructor(camera, arena) {
@@ -4079,10 +4833,11 @@ class CameraRig {
     this.ballCamT += ((ballCam && ball ? 1 : 0) - this.ballCamT) * k;
     this.backT += ((lookBack ? 1 : 0) - this.backT) * (1 - Math.exp(-dt * 14));
 
-    // camera up: car up on surfaces (wall driving), world up in the air
+    // camera up: the car's up on surfaces (walls/ceiling), world up in the air. Rolling onto a wall
+    // is eased over ~0.25 s; leaving a wall eases back more gently so jumps off walls stay readable.
     const carUp = _u.set(0, 1, 0).applyQuaternion(carQuat);
     const wantUp = onGround ? carUp : _t.set(0, 1, 0);
-    this.up.lerp(wantUp, 1 - Math.exp(-dt * 5)).normalize();
+    this.up.lerp(wantUp, 1 - Math.exp(-dt * (onGround ? 7 : 3.5))).normalize();
 
     // heading for car cam: car forward flattened against camera up
     const carFwd = _f.set(0, 0, 1).applyQuaternion(carQuat);
@@ -4094,64 +4849,76 @@ class CameraRig {
     carFwd.addScaledVector(this.up, -carFwd.dot(this.up));
     if (carFwd.lengthSq() < 1e-4) carFwd.copy(this.fwd);
     carFwd.normalize();
-    let want = carFwd.clone();
+    const want = _w.copy(carFwd);
     if (ball && this.ballCamT > 0.001) {
       const toBall = _v.copy(ball).sub(carPos);
       toBall.addScaledVector(this.up, -toBall.dot(this.up));
       if (toBall.lengthSq() > 0.5) { toBall.normalize(); want.lerp(toBall, this.ballCamT).normalize(); }
     }
-    if (this.backT > 0.001) want.lerp(want.clone().negate(), this.backT);
-    // swivel smoothing
+    if (this.backT > 0.001) want.lerp(_v.copy(want).negate(), this.backT);
+    // swivel smoothing (keep fwd perpendicular to up, so the roll onto a wall never pitches the view)
     const sw = 1 - Math.exp(-dt * s.swivelSpeed * 2.2);
     this.fwd.lerp(want, sw);
     this.fwd.addScaledVector(this.up, -this.fwd.dot(this.up));
     if (this.fwd.lengthSq() < 1e-4) this.fwd.copy(want);
     this.fwd.normalize();
 
-    // target position behind and above the car
-    const target = _t.copy(carPos).addScaledVector(this.fwd, -s.distance).addScaledVector(this.up, s.height);
-    const stiff = 1 - Math.exp(-dt * (6 + s.stiffness * 30));
-    this.pos.lerp(target, stiff);
-    // never trail too far behind at speed
-    const maxD = s.distance * 1.6 + 1;
-    _v.copy(this.pos).sub(carPos);
-    if (_v.length() > maxD) this.pos.copy(carPos).addScaledVector(_v.normalize(), maxD);
+    // offset from the car, smoothed in car-relative terms: rotation is eased, but the camera never
+    // lags behind in world space (which made it swing through the floor curve onto walls)
+    const off = _t.copy(this.fwd).multiplyScalar(-s.distance).addScaledVector(this.up, s.height);
+    if (!this.offset) this.offset = off.clone();
+    this.offset.lerp(off, 1 - Math.exp(-dt * (8 + s.stiffness * 30)));
+    this.pos.copy(carPos).add(this.offset);
     this.collide(carPos);
 
     // look target: slightly ahead of the car, towards the ball in ball cam
     const look = _v.copy(carPos).addScaledVector(this.up, 0.35 + s.height * 0.25).addScaledVector(this.fwd, 1.2);
     if (ball && this.ballCamT > 0.001) {
-      const mid = new THREE.Vector3().copy(ball).sub(carPos);
+      const mid = _m.copy(ball).sub(carPos);
       const dist = mid.length();
       mid.multiplyScalar(Math.min(0.5, 6 / Math.max(dist, 1)) + 0.12).add(carPos);
-      mid.y = Math.min(mid.y, carPos.y + 6);
+      // don't crane above the car's own surface plane much (keeps wall play readable)
+      const lift = mid.clone().sub(carPos).dot(this.up);
+      if (lift > 6) mid.addScaledVector(this.up, 6 - lift);
       look.lerp(mid, this.ballCamT);
     }
+    // squeezed against a surface (e.g. ball cam pointing into a wall): favour the car so it stays in frame
+    const dc = this.pos.distanceTo(carPos), room = Math.max(1, s.distance * 0.8);
+    if (dc < room) look.lerp(_m.copy(carPos).addScaledVector(this.up, 0.3), (1 - dc / room) * 0.85);
+    if (!this.lookInit) { this.look.copy(look); this.lookInit = true; }
     this.look.lerp(look, 1 - Math.exp(-dt * 18));
     this.apply(dt, s);
   }
 
-  // Keep the camera inside the arena: march from the car towards the desired camera spot and stop
-  // short of the first surface (walls, ceiling, goal frames), so it never ends up outside the glass.
+  // Keep the camera inside the arena. Push it out of any surface along the surface normal, so near
+  // walls, the floor curve, the ceiling or goal frames it slides along the surface instead of
+  // zooming into the car; then make sure the car is still in view through the volume.
   collide(carPos) {
-    const a = this.arena, margin = 0.45;
+    const a = this.arena, margin = 0.5, e = 0.02;
+    const p = this.pos;
+    for (let i = 0; i < 6; i++) {
+      const d = a.interior(p.x, p.y, p.z);
+      if (d >= margin) break;
+      const nx = a.interior(p.x + e, p.y, p.z) - a.interior(p.x - e, p.y, p.z);
+      const ny = a.interior(p.x, p.y + e, p.z) - a.interior(p.x, p.y - e, p.z);
+      const nz = a.interior(p.x, p.y, p.z + e) - a.interior(p.x, p.y, p.z - e);
+      const l = Math.hypot(nx, ny, nz) || 1;
+      p.x += (nx / l) * (margin - d); p.y += (ny / l) * (margin - d); p.z += (nz / l) * (margin - d);
+    }
+    // line of sight (only goal boxes/rims can block it, the bowl itself is convex)
     const px = carPos.x + this.up.x * 0.45, py = carPos.y + this.up.y * 0.45, pz = carPos.z + this.up.z * 0.45;
-    const dx = this.pos.x - px, dy = this.pos.y - py, dz = this.pos.z - pz;
+    const dx = p.x - px, dy = p.y - py, dz = p.z - pz;
     const len = Math.hypot(dx, dy, dz);
-    if (len < 1e-4) return;
+    if (len < 1e-4 || a.interior(px, py, pz) < 0.2) return;
     const ux = dx / len, uy = dy / len, uz = dz / len;
     let t = 0, safe = 0;
-    if (a.interior(px, py, pz) < margin) { this.pos.set(px, py, pz); return; }
     while (t < len) {
       const d = a.interior(px + ux * t, py + uy * t, pz + uz * t);
-      if (d < margin) break;
+      if (d < 0.2) break;
       safe = t;
-      t += Math.max(0.05, d - margin);
+      t += Math.max(0.05, d - 0.2);
     }
-    if (t < len) {
-      const k = Math.max(0, safe);
-      this.pos.set(px + ux * k, py + uy * k, pz + uz * k);
-    }
+    if (t < len) p.set(px + ux * safe, py + uy * safe, pz + uz * safe);
   }
 
   apply(dt, s) {
@@ -4199,6 +4966,181 @@ class CameraRig {
 return { CameraRig };
 })();
 
+// ---- client/render/post.js
+__m["client/render/post.js"] = (() => {
+// Post-processing: the scene is rendered into an HDR (half-float, multisampled) target, then
+//   bloom      dual-filter downsample/upsample chain of everything above a soft threshold
+//   composite  exposure, ACES filmic tone mapping, contrast/saturation grade, vignette,
+//              speed-dependent chromatic fringe at the screen edges, fine film grain, sRGB encode
+// No external post-processing library: a handful of small shaders and render targets.
+const THREE = __m["three"];
+
+const VERT = 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }';
+
+const PREFILTER = `uniform sampler2D tSrc; uniform vec2 texel; uniform float threshold; uniform float knee; varying vec2 vUv;
+  vec3 tap(vec2 o){ return texture2D(tSrc, vUv + o * texel).rgb; }
+  void main(){
+    vec3 c = (tap(vec2(-1.0,-1.0)) + tap(vec2(1.0,-1.0)) + tap(vec2(-1.0,1.0)) + tap(vec2(1.0,1.0))) * 0.25;
+    c = min(c, vec3(60.0)); // tame fireflies
+    if (any(isnan(c))) c = vec3(0.0);
+    float br = max(c.r, max(c.g, c.b));
+    float soft = clamp(br - threshold + knee, 0.0, 2.0 * knee);
+    soft = soft * soft / (4.0 * knee + 1e-4);
+    float contrib = max(soft, br - threshold) / max(br, 1e-4);
+    gl_FragColor = vec4(c * contrib, 1.0);
+  }`;
+
+// dual Kawase filters
+const DOWN = `uniform sampler2D tSrc; uniform vec2 texel; varying vec2 vUv;
+  void main(){
+    vec3 s = texture2D(tSrc, vUv).rgb * 4.0;
+    s += texture2D(tSrc, vUv + vec2(-1.0,-1.0) * texel).rgb;
+    s += texture2D(tSrc, vUv + vec2( 1.0,-1.0) * texel).rgb;
+    s += texture2D(tSrc, vUv + vec2(-1.0, 1.0) * texel).rgb;
+    s += texture2D(tSrc, vUv + vec2( 1.0, 1.0) * texel).rgb;
+    gl_FragColor = vec4(s / 8.0, 1.0);
+  }`;
+const UP = `uniform sampler2D tSrc; uniform vec2 texel; uniform float weight; varying vec2 vUv;
+  void main(){
+    vec3 s = vec3(0.0);
+    s += texture2D(tSrc, vUv + vec2(-2.0, 0.0) * texel).rgb;
+    s += texture2D(tSrc, vUv + vec2( 2.0, 0.0) * texel).rgb;
+    s += texture2D(tSrc, vUv + vec2( 0.0,-2.0) * texel).rgb;
+    s += texture2D(tSrc, vUv + vec2( 0.0, 2.0) * texel).rgb;
+    s += texture2D(tSrc, vUv + vec2(-1.0,-1.0) * texel).rgb * 2.0;
+    s += texture2D(tSrc, vUv + vec2( 1.0,-1.0) * texel).rgb * 2.0;
+    s += texture2D(tSrc, vUv + vec2(-1.0, 1.0) * texel).rgb * 2.0;
+    s += texture2D(tSrc, vUv + vec2( 1.0, 1.0) * texel).rgb * 2.0;
+    gl_FragColor = vec4(s / 12.0 * weight, 1.0);
+  }`;
+
+const COMPOSITE = `uniform sampler2D tScene; uniform sampler2D tBloom; uniform float bloom; uniform float exposure;
+  uniform float contrast; uniform float saturation; uniform float vignette; uniform float grain; uniform float time;
+  uniform float fringe; uniform vec3 lift; uniform vec3 gain; varying vec2 vUv;
+  vec3 RRTAndODTFit(vec3 v){ vec3 a = v * (v + 0.0245786) - 0.000090537; vec3 b = v * (0.983729 * v + 0.4329510) + 0.238081; return a / b; }
+  vec3 aces(vec3 c){
+    const mat3 inM = mat3(vec3(0.59719,0.07600,0.02840), vec3(0.35458,0.90834,0.13383), vec3(0.04823,0.01566,0.83777));
+    const mat3 outM = mat3(vec3(1.60475,-0.10208,-0.00327), vec3(-0.53108,1.10813,-0.07276), vec3(-0.07367,-0.00605,1.07602));
+    c *= 1.0 / 0.6; c = inM * c; c = RRTAndODTFit(c); c = outM * c; return clamp(c, 0.0, 1.0);
+  }
+  vec3 toSRGB(vec3 c){ return mix(c * 12.92, 1.055 * pow(c, vec3(1.0/2.4)) - 0.055, step(0.0031308, c)); }
+  float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233)) + time * 37.0) * 43758.5453); }
+  void main(){
+    vec2 d = vUv - 0.5;
+    float r2 = dot(d, d);
+    vec3 col;
+    if (fringe > 0.0005) {
+      vec2 o = d * r2 * fringe;
+      col = vec3(texture2D(tScene, vUv - o).r, texture2D(tScene, vUv).g, texture2D(tScene, vUv + o).b);
+    } else col = texture2D(tScene, vUv).rgb;
+    vec3 bl = texture2D(tBloom, vUv).rgb;
+    if (any(isnan(bl))) bl = vec3(0.0);
+    col += bl * bloom;
+    col = aces(col * exposure);
+    // grade in display-ish space
+    float l = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    col = mix(vec3(l), col, saturation);
+    col = (col - 0.5) * contrast + 0.5;
+    col = col * gain + lift * (1.0 - col);
+    col *= mix(1.0, smoothstep(0.85, 0.2, r2 * 2.2), vignette);
+    col = toSRGB(clamp(col, 0.0, 1.0));
+    col += (hash(vUv * 731.0) - 0.5) * grain;
+    gl_FragColor = vec4(col, 1.0);
+  }`;
+
+class PostFX {
+  constructor(renderer) {
+    this.r = renderer;
+    this.levels = 6;
+    const hdr = { type: THREE.HalfFloatType, colorSpace: THREE.LinearSRGBColorSpace };
+    this.rt = new THREE.WebGLRenderTarget(4, 4, { ...hdr, samples: 4, depthBuffer: true });
+    this.mips = [];
+    for (let i = 0; i < this.levels; i++) this.mips.push(new THREE.WebGLRenderTarget(4, 4, { ...hdr, depthBuffer: false }));
+    const mat = (frag, uniforms, extra = {}) => new THREE.ShaderMaterial({ vertexShader: VERT, fragmentShader: frag, uniforms, depthTest: false, depthWrite: false, toneMapped: false, ...extra });
+    this.prefilter = mat(PREFILTER, { tSrc: { value: null }, texel: { value: new THREE.Vector2() }, threshold: { value: 1.0 }, knee: { value: 0.5 } });
+    this.down = mat(DOWN, { tSrc: { value: null }, texel: { value: new THREE.Vector2() } });
+    this.up = mat(UP, { tSrc: { value: null }, texel: { value: new THREE.Vector2() }, weight: { value: 1 } }, { blending: THREE.AdditiveBlending, transparent: true });
+    this.composite = mat(COMPOSITE, {
+      tScene: { value: this.rt.texture }, tBloom: { value: this.mips[0].texture }, bloom: { value: 0.6 }, exposure: { value: 1.0 },
+      contrast: { value: 1.06 }, saturation: { value: 1.12 }, vignette: { value: 0.45 }, grain: { value: 0.025 }, time: { value: 0 },
+      fringe: { value: 0 }, lift: { value: new THREE.Vector3(0.0, 0.004, 0.012) }, gain: { value: new THREE.Vector3(1.0, 1.0, 1.0) },
+    });
+    this.quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.composite);
+    this.quad.frustumCulled = false;
+    this.qscene = new THREE.Scene(); this.qscene.add(this.quad);
+    this.qcam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    this.w = 0; this.h = 0;
+    this.time = 0;
+    this.speed = 0;
+  }
+
+  setSize(w, h) {
+    if (w === this.w && h === this.h) return;
+    this.w = w; this.h = h;
+    this.rt.setSize(w, h);
+    let mw = Math.max(1, w >> 1), mh = Math.max(1, h >> 1);
+    for (const m of this.mips) { m.setSize(mw, mh); mw = Math.max(1, mw >> 1); mh = Math.max(1, mh >> 1); }
+  }
+
+  pass(material, target) {
+    this.quad.material = material;
+    this.r.setRenderTarget(target);
+    this.r.render(this.qscene, this.qcam);
+  }
+
+  // look: {bloom, threshold, exposure, saturation, contrast, vignette, grain, fringe}
+  render(scene, camera, dt, look = {}) {
+    const r = this.r;
+    const size = r.getDrawingBufferSize(_size);
+    this.setSize(size.x, size.y);
+    this.time = (this.time + dt) % 1000;
+    const prevAuto = r.autoClear;
+    r.setRenderTarget(this.rt);
+    r.render(scene, camera);
+    r.autoClear = true;
+    // bloom chain
+    const p = this.prefilter.uniforms;
+    p.tSrc.value = this.rt.texture; p.texel.value.set(1 / this.w, 1 / this.h);
+    p.threshold.value = look.threshold ?? 1.0; p.knee.value = (look.threshold ?? 1.0) * 0.5;
+    this.pass(this.prefilter, this.mips[0]);
+    for (let i = 1; i < this.levels; i++) {
+      const src = this.mips[i - 1];
+      this.down.uniforms.tSrc.value = src.texture; this.down.uniforms.texel.value.set(1 / src.width, 1 / src.height);
+      this.pass(this.down, this.mips[i]);
+    }
+    r.autoClear = false;
+    for (let i = this.levels - 1; i > 0; i--) {
+      const src = this.mips[i];
+      this.up.uniforms.tSrc.value = src.texture; this.up.uniforms.texel.value.set(0.5 / src.width, 0.5 / src.height);
+      this.up.uniforms.weight.value = 1.0;
+      this.pass(this.up, this.mips[i - 1]);
+    }
+    r.autoClear = true;
+    // composite to screen
+    const c = this.composite.uniforms;
+    c.bloom.value = (look.bloom ?? 0.6) / this.levels * 2.2;
+    c.exposure.value = look.exposure ?? 1.0;
+    c.saturation.value = look.saturation ?? 1.12;
+    c.contrast.value = look.contrast ?? 1.06;
+    c.vignette.value = look.vignette ?? 0.32;
+    c.grain.value = look.grain ?? 0.025;
+    c.fringe.value = look.fringe ?? 0;
+    c.time.value = this.time;
+    this.pass(this.composite, null);
+    r.autoClear = prevAuto;
+  }
+
+  dispose() {
+    this.rt.dispose(); for (const m of this.mips) m.dispose();
+    for (const m of [this.prefilter, this.down, this.up, this.composite]) m.dispose();
+    this.quad.geometry.dispose();
+  }
+}
+const _size = new THREE.Vector2();
+
+return { PostFX };
+})();
+
 // ---- client/render/scene.js
 __m["client/render/scene.js"] = (() => {
 // GameRenderer: owns the three.js renderer, the arena, ball, cars, pads and effects.
@@ -4207,7 +5149,59 @@ const { buildArena, ARENA_THEMES } = __m["client/render/arenaMesh.js"];
 const { buildCar, disposeObject, glowTexture } = __m["client/render/carMesh.js"];
 const { Particles, Rings, goalExplosion } = __m["client/render/effects.js"];
 const { CameraRig } = __m["client/camera.js"];
+const { PostFX } = __m["client/render/post.js"];
 const { BALL } = __m["shared/config.js"];
+
+let _blobGeo = null, _blobTex = null;
+// soft dark ellipse under each car (contact shadow / ambient occlusion)
+function blobTexture() {
+  if (_blobTex) return _blobTex;
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const g = c.getContext('2d');
+  const rg = g.createRadialGradient(64, 64, 4, 64, 64, 64);
+  rg.addColorStop(0, 'rgba(0,0,0,0.85)'); rg.addColorStop(0.55, 'rgba(0,0,0,0.45)'); rg.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = rg; g.fillRect(0, 0, 128, 128);
+  _blobTex = new THREE.CanvasTexture(c);
+  return _blobTex;
+}
+
+const PAD_PARTS = ['sDecal', 'lDecal', 'sBase', 'lBase', 'sOrb', 'lOrb', 'sBeam', 'lBeam', 'lRing'];
+
+// Vertex-colour gradient along an axis (top colour -> bottom colour).
+function gradientGeo(geo, top, bottom, axis = 'y') {
+  geo.computeBoundingBox();
+  const bb = geo.boundingBox, lo = bb.min[axis], hi = bb.max[axis];
+  const p = geo.attributes.position, cols = new Float32Array(p.count * 3);
+  const a = new THREE.Color(top), b = new THREE.Color(bottom), c = new THREE.Color();
+  const ax = axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
+  for (let i = 0; i < p.count; i++) {
+    const k = hi > lo ? (p.getComponent(i, ax) - lo) / (hi - lo) : 1;
+    c.copy(b).lerp(a, k); cols[i * 3] = c.r; cols[i * 3 + 1] = c.g; cols[i * 3 + 2] = c.b;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+  return geo;
+}
+
+function padTextures() {
+  const decal = (S, ticks) => {
+    const c = document.createElement('canvas'); c.width = c.height = S;
+    const g = c.getContext('2d'), m = S / 2;
+    const rg = g.createRadialGradient(m, m, 0, m, m, m);
+    rg.addColorStop(0, 'rgba(255,248,214,0.95)'); rg.addColorStop(0.22, 'rgba(255,214,102,0.9)'); rg.addColorStop(0.5, 'rgba(255,146,30,0.6)');
+    rg.addColorStop(0.74, 'rgba(255,84,0,0.16)'); rg.addColorStop(0.84, 'rgba(255,196,84,0.95)'); rg.addColorStop(0.9, 'rgba(255,120,20,0.45)'); rg.addColorStop(1, 'rgba(255,90,0,0)');
+    g.fillStyle = rg; g.fillRect(0, 0, S, S);
+    g.strokeStyle = 'rgba(255,240,190,0.8)'; g.lineWidth = S / 64;
+    for (let i = 0; i < ticks; i++) { const a = (i / ticks) * Math.PI * 2; g.beginPath(); g.moveTo(m + Math.cos(a) * m * 0.58, m + Math.sin(a) * m * 0.58); g.lineTo(m + Math.cos(a) * m * 0.7, m + Math.sin(a) * m * 0.7); g.stroke(); }
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+  };
+  const bc = document.createElement('canvas'); bc.width = 8; bc.height = 256;
+  const bg = bc.getContext('2d');
+  const lg = bg.createLinearGradient(0, 0, 0, 256);
+  lg.addColorStop(0, 'rgba(255,120,20,0)'); lg.addColorStop(0.45, 'rgba(255,140,30,0.18)'); lg.addColorStop(0.85, 'rgba(255,196,80,0.55)'); lg.addColorStop(1, 'rgba(255,240,180,0.9)');
+  bg.fillStyle = lg; bg.fillRect(0, 0, 8, 256);
+  const beam = new THREE.CanvasTexture(bc); beam.colorSpace = THREE.SRGBColorSpace;
+  return { decalSmall: decal(128, 6), decalLarge: decal(256, 12), beam };
+}
 
 const _p = new THREE.Vector3(), _q = new THREE.Quaternion(), _v = new THREE.Vector3(), _a = new THREE.Vector3(), _q2 = new THREE.Quaternion();
 
@@ -4304,6 +5298,7 @@ class GameRenderer {
     this.arenaObj = null;
     this.rig = null;
     this.time = 0;
+    this.post = new PostFX(this.renderer);
     this.envMap = makeEnvironment(this.renderer);
     this.scene.environment = this.envMap;
     this.initShowroom();
@@ -4371,7 +5366,34 @@ class GameRenderer {
     }
     sr.ring.material.color.setHSL(0.53 + Math.sin(sr.t * 0.5) * 0.03, 1, 0.68);
     sr.fx.update(dt); sr.rings.update(dt);
-    this.renderer.render(sr.scene, cam);
+    this.renderView(sr.scene, cam, dt, { bloom: 0.5, threshold: 1.5, exposure: 0.85, vignette: 0.5 });
+  }
+
+  usePost() { return this.settings.postFx !== false && this.settings.quality !== 'low'; }
+  renderView(scene, camera, dt, look) {
+    if (this.usePost()) this.post.render(scene, camera, dt, look);
+    else this.renderer.render(scene, camera);
+  }
+
+  // Reflections that match the arena: capture the built arena into a prefiltered environment map
+  // (from a point above the centre spot) and use it for every PBR material in the scene.
+  captureEnvironment() {
+    if (this.arenaEnv) { this.arenaEnv.dispose(); this.arenaEnv = null; }
+    const g = this.arenaObj.group;
+    const pads = this.padField ? PAD_PARTS.map((k) => this.padField[k]) : [];
+    for (const m of pads) m.visible = false;
+    const hidden = [this.ball, this.ballShadow, this.ballOutline].filter((o) => o.visible);
+    for (const o of hidden) o.visible = false;
+    g.position.y -= 7; g.updateMatrixWorld(true);
+    const pm = new THREE.PMREMGenerator(this.renderer);
+    try { this.arenaEnv = pm.fromScene(this.scene, 0.015, 0.1, 1200); } catch { this.arenaEnv = null; }
+    pm.dispose();
+    g.position.y += 7; g.updateMatrixWorld(true);
+    for (const m of pads) m.visible = true;
+    for (const o of hidden) o.visible = true;
+    // ambient image lighting stays on the bright studio map; the arena capture is used as the
+    // reflection source for car paint, glass and rims (see syncCars)
+    this.scene.environment = this.envMap;
   }
 
   applyQuality(q) {
@@ -4400,36 +5422,45 @@ class GameRenderer {
     this.arenaObj = buildArena(arena, themeId, colors, this.settings.quality);
     this.scene.add(this.arenaObj.group);
     const th = this.arenaObj.theme;
-    this.scene.background = new THREE.Color(th.sky);
-    this.scene.fog = new THREE.Fog(th.fog, 120, 340);
+    this.scene.background = new THREE.Color(th.sky.horizon);
+    this.scene.fog = new THREE.Fog(th.fog, ...(th.fogRange || [140, 520]));
     this.buildPads(arena.pads);
+    this.captureEnvironment();
     this.rig = new CameraRig(this.camera, arena);
     this.clearCars();
   }
 
-  // Boost pads as instanced meshes (a few draw calls for all pads).
+  // Boost pads as instanced meshes (a few draw calls for all pads). Gradient decals on the
+  // floor, gradient-shaded plates and orbs, and a fading light column over every pad.
   buildPads(pads) {
-    const mk = (geo, mat, list) => { const m = new THREE.InstancedMesh(geo, mat, Math.max(1, list.length)); m.count = list.length; m.instanceMatrix.setUsage(THREE.DynamicDrawUsage); this.scene.add(m); return m; };
+    const mk = (geo, mat, list, order = 0) => { const m = new THREE.InstancedMesh(geo, mat, Math.max(1, list.length)); m.count = list.length; m.instanceMatrix.setUsage(THREE.DynamicDrawUsage); m.frustumCulled = false; m.renderOrder = order; this.scene.add(m); return m; };
     const small = pads.filter((p) => !p.large), large = pads.filter((p) => p.large);
-    const baseMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6 });
-    const orbMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-    const haloMat = new THREE.MeshBasicMaterial({ map: glowTexture(), color: 0xffffff, transparent: true, opacity: 0.6, blending: THREE.AdditiveBlending, depthWrite: false });
+    const T = padTextures();
+    const plateMat = new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.35, metalness: 0.55 });
+    const orbMat = new THREE.MeshBasicMaterial({ color: 0xffffff, vertexColors: true });
+    const decalMat = (map) => new THREE.MeshBasicMaterial({ map, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2 });
+    const beamMat = new THREE.MeshBasicMaterial({ map: T.beam, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0xffffff, vertexColors: true });
     const P = {
-      pads, small, large,
-      sBase: mk(new THREE.CylinderGeometry(0.55, 0.65, 0.08, 20), baseMat, small), lBase: mk(new THREE.CylinderGeometry(1.0, 1.15, 0.08, 24), baseMat, large),
-      sOrb: mk(new THREE.SphereGeometry(0.18, 12, 8), orbMat, small), lOrb: mk(new THREE.SphereGeometry(0.5, 16, 12), orbMat, large),
-      sHalo: mk(new THREE.PlaneGeometry(1.3, 1.3).rotateX(-Math.PI / 2), haloMat, small), lHalo: mk(new THREE.PlaneGeometry(3.2, 3.2).rotateX(-Math.PI / 2), haloMat, large),
-      lRing: mk(new THREE.TorusGeometry(0.85, 0.05, 8, 32).rotateX(Math.PI / 2), orbMat, large),
+      pads, small, large, T,
+      sDecal: mk(new THREE.PlaneGeometry(1.9, 1.9).rotateX(-Math.PI / 2), decalMat(T.decalSmall), small, 1),
+      lDecal: mk(new THREE.PlaneGeometry(4.2, 4.2).rotateX(-Math.PI / 2), decalMat(T.decalLarge), large, 1),
+      sBase: mk(gradientGeo(new THREE.CylinderGeometry(0.5, 0.62, 0.1, 6), 0xfff2c4, 0x7a3a06), plateMat, small),
+      lBase: mk(gradientGeo(new THREE.CylinderGeometry(1.0, 1.18, 0.14, 32), 0xfff2c4, 0x7a3a06), plateMat, large),
+      sOrb: mk(gradientGeo(new THREE.OctahedronGeometry(0.2, 1), 0xfffbe6, 0xff7a00), orbMat, small),
+      lOrb: mk(gradientGeo(new THREE.IcosahedronGeometry(0.5, 2), 0xfffbe6, 0xff6a00), orbMat, large),
+      sBeam: mk(new THREE.CylinderGeometry(0.42, 0.5, 0.9, 20, 1, true).translate(0, 0.45, 0), beamMat, small, 3),
+      lBeam: mk(new THREE.CylinderGeometry(0.95, 1.05, 3.4, 32, 1, true).translate(0, 1.7, 0), beamMat, large, 3),
+      lRing: mk(gradientGeo(new THREE.TorusGeometry(0.85, 0.05, 8, 40).rotateX(Math.PI / 2), 0xffe08a, 0xff5a00, 'x'), ringMat, large),
       m: new THREE.Matrix4(), q: new THREE.Quaternion(), v: new THREE.Vector3(), s: new THREE.Vector3(), c: new THREE.Color(),
     };
-    for (const k of ['sBase', 'lBase', 'sOrb', 'lOrb', 'sHalo', 'lHalo', 'lRing']) P[k].frustumCulled = false;
-    P.sHalo.renderOrder = 1; P.lHalo.renderOrder = 1;
     this.padField = P;
     this.updatePads(null, 0);
   }
   disposePads() {
     const P = this.padField; if (!P) return;
-    for (const k of ['sBase', 'lBase', 'sOrb', 'lOrb', 'sHalo', 'lHalo', 'lRing']) { this.scene.remove(P[k]); P[k].geometry.dispose(); }
+    for (const k of PAD_PARTS) { this.scene.remove(P[k]); P[k].geometry.dispose(); }
+    for (const t of Object.values(P.T)) t.dispose();
     this.padField = null;
   }
   updatePads(timers, t) {
@@ -4440,18 +5471,19 @@ class GameRenderer {
       m.compose(v.set(x, y, z), q, s.set(sc, sc, sc)); mesh.setMatrixAt(i, m);
       if (color !== undefined) mesh.setColorAt(i, c.set(color));
     };
-    const each = (list, base, orb, halo, ring, large) => list.forEach((p, i) => {
+    const each = (list, large) => list.forEach((p, i) => {
       const idx = P.pads.indexOf(p);
       const on = !(timers && timers[idx] > 0);
-      const col = large ? 0xffb020 : 0xffd27a;
-      put(base, i, p.x, 0.05, p.z, 1, on ? col : 0x3a3f4b);
-      put(orb, i, p.x, (large ? 1.0 : 0.35) + Math.sin(t * 2 + idx) * 0.06, p.z, on ? 1 : 0, col);
-      put(halo, i, p.x, 0.1, p.z, 1, on ? new THREE.Color(col).multiplyScalar(0.8 + Math.sin(t * 3 + idx) * 0.2) : 0x080808);
-      if (ring) put(ring, i, p.x, 1.0, p.z, on ? 1 : 0, col, t + idx);
+      const pulse = 0.85 + Math.sin(t * 3 + idx) * 0.15;
+      put(large ? P.lDecal : P.sDecal, i, p.x, 0.02, p.z, 1, on ? c.setScalar(pulse).getHex() : 0x2a2e36);
+      put(large ? P.lBase : P.sBase, i, p.x, 0.05, p.z, 1, on ? 0xffffff : 0x3a3f4b, large ? 0 : Math.PI / 6);
+      put(large ? P.lOrb : P.sOrb, i, p.x, (large ? 1.15 : 0.42) + Math.sin(t * 2 + idx) * 0.07, p.z, on ? 1 : 0, 0xffffff, t * (large ? 0.8 : 1.6) + idx);
+      put(large ? P.lBeam : P.sBeam, i, p.x, 0.06, p.z, on ? 1 : 0, c.setScalar(0.7 + Math.sin(t * 4 + idx) * 0.3).getHex(), -t * 0.5);
+      if (large) put(P.lRing, i, p.x, 1.15 + Math.sin(t * 2 + idx) * 0.07, p.z, on ? 1 : 0, 0xffffff, t + idx);
     });
-    each(P.small, P.sBase, P.sOrb, P.sHalo, null, false);
-    each(P.large, P.lBase, P.lOrb, P.lHalo, P.lRing, true);
-    for (const k of ['sBase', 'lBase', 'sOrb', 'lOrb', 'sHalo', 'lHalo', 'lRing']) { P[k].instanceMatrix.needsUpdate = true; if (P[k].instanceColor) P[k].instanceColor.needsUpdate = true; }
+    each(P.small, false);
+    each(P.large, true);
+    for (const k of PAD_PARTS) { P[k].instanceMatrix.needsUpdate = true; if (P[k].instanceColor) P[k].instanceColor.needsUpdate = true; }
   }
 
   clearCars() { for (const c of this.cars.values()) { this.scene.remove(c.obj); disposeObject(c.obj); } this.cars.clear(); }
@@ -4469,7 +5501,14 @@ class GameRenderer {
       const obj = buildCar(r.cos, col);
       let plate = null;
       if (r.pid !== myPid) { plate = nameSprite(r.name || '?', col.css); obj.add(plate); plate.position.set(0, 1.25, 0); plate.userData.keepUpright = true; }
-      obj.traverse((o) => { if (o.isMesh) o.castShadow = this.settings.quality === 'high'; });
+      obj.traverse((o) => {
+        if (!o.isMesh) return;
+        o.castShadow = this.settings.quality === 'high';
+        const m = o.material;
+        if (this.arenaEnv && m && m.isMeshStandardMaterial && (m.metalness > 0.2 || m.clearcoat > 0)) { m.envMap = this.arenaEnv.texture; m.envMapIntensity = 1.6; m.needsUpdate = true; }
+      });
+      const blob = new THREE.Mesh(_blobGeo || (_blobGeo = new THREE.PlaneGeometry(2.6, 3.4).rotateX(-Math.PI / 2)), new THREE.MeshBasicMaterial({ map: blobTexture(), transparent: true, depthWrite: false, opacity: 0.75, polygonOffset: true, polygonOffsetFactor: -4 }));
+      blob.position.y = -0.33; blob.renderOrder = 1; blob.userData.contact = true; obj.add(blob);
       this.scene.add(obj);
       this.cars.set(r.pid, { obj, key, plate, trail: r.cos?.trail || 'ion', team: r.team, spin: 0 });
     }
@@ -4526,6 +5565,8 @@ class GameRenderer {
       }
       if (rc.obj.userData.halo) rc.obj.userData.halo.rotation.z += dt;
       if (rc.plate) rc.plate.visible = !!s.nameplates && !c.hidden;
+      const blob = rc.obj.children.find((o) => o.userData.contact);
+      if (blob) blob.material.opacity += ((c.onGround ? 0.75 : 0) - blob.material.opacity) * Math.min(1, dt * 12);
     }
     // ball
     const b = view.ball;
@@ -4545,12 +5586,22 @@ class GameRenderer {
       this.ballOutline.visible = !!s.ballOutline;
       this.ballOutline.position.copy(b.pos);
     } else this.ballOutline.visible = false;
-    // pads
+    // dropshot: ball glows in the charging team's colour, brighter per charge level
+    const bm = this.ball.material;
+    if (view.drop && view.drop.active && view.drop.team >= 0) {
+      bm.emissive.set((this.colors[view.drop.team] || this.colors[0]).main);
+      bm.emissiveIntensity = [0, 0.45, 1.1, 2.2][view.drop.level] * (0.85 + Math.sin(this.time * (4 + view.drop.level * 3)) * 0.15);
+    } else if (bm.emissiveIntensity !== 0.3) { bm.emissive.set(0x1e293b); bm.emissiveIntensity = 0.3; }
+    // pads, tiles, animated scenery
     if (view.pads) this.updatePads(view.pads, this.time);
+    if (this.arenaObj?.setTiles) this.arenaObj.setTiles(view.tiles || null, this.time);
+    this.arenaObj?.update(dt, this.time);
     this.fx.update(dt);
     this.rings.update(dt);
     if (this.flash.intensity > 0) this.flash.intensity = Math.max(0, this.flash.intensity - dt * 900);
-    this.renderer.render(this.scene, this.camera);
+    const look = this.arenaObj?.theme.look || {};
+    const sp = this.rig?.speed || 0;
+    this.renderView(this.scene, this.camera, dt, { ...look, fringe: s.speedFx !== false ? Math.min(1, Math.max(0, (sp - 18) / 6)) * 0.02 : 0 });
   }
 
   goal(pos, team, styleId) {
@@ -4576,6 +5627,12 @@ class GameRenderer {
   respawnFx(pos, team) {
     const col = this.colors[team] || this.colors[0];
     this.fx.burst(pos.x, pos.y + 0.3, pos.z, 40, 3, 0.6, 0.2, [col.main, col.light, 0xffffff], { up: 2, endSize: 0.02 });
+  }
+  tileBreak(e) {
+    const col = this.colors[e.team] || this.colors[0];
+    const n = 30 + e.level * 30;
+    this.fx.burst(e.x, 0.3, e.z, n, 5 + e.level * 2, 0.8, 0.22, [col.light, col.main, 0xffffff], { up: 4, endSize: 0.05 });
+    this.rings.add(new THREE.Vector3(e.x, 0.2, e.z), new THREE.Vector3(0, 1, 0), col.main, 3 + e.level * 3, 0.45);
   }
   dust(pos) {
     this.fx.burst(pos.x, 0.15, pos.z, 10, 2.5, 0.6, 0.35, [0x9ca3af], { flat: true, alpha: 0.4, endSize: 0.6 });
@@ -5033,11 +6090,11 @@ __m["client/profile.js"] = (() => {
 // Local player profile (progression, statistics, cosmetics) and persisted settings.
 // This is a LOCAL profile stored on this device — not an authenticated online account.
 const { store } = __m["client/store.js"];
-const { DEFAULT_LOADOUT, CATALOG, unlockLevel, unlocksAt } = __m["client/cosmetics.js"];
+const { DEFAULT_LOADOUT, CATALOG } = __m["client/cosmetics.js"];
 
 const DEFAULT_SETTINGS = {
   // display
-  quality: 'high', renderScale: 1, fpsLimit: 0, vsync: true, displayMode: 'windowed', showFps: false,
+  quality: 'high', postFx: true, speedFx: true, renderScale: 1, fpsLimit: 0, vsync: true, displayMode: 'windowed', showFps: false,
   // camera
   fov: 108, distance: 3.0, height: 1.05, speedFov: 6, stiffness: 0.45, swivelSpeed: 4.5, transitionSpeed: 1.2, cameraShake: false, ballCamDefault: true,
   // controls
@@ -5071,7 +6128,8 @@ class Profile {
   }
   save() { store.set('profile', { name: this.name, level: this.level, xp: this.xp, stats: this.stats, loadout: this.loadout, history: this.history.slice(0, 20), created: this.created }); }
 
-  isUnlocked(slot, id) { return unlockLevel(slot, id) <= this.level; }
+  // Everything is unlocked from the start; levels only track how much you have played.
+  isUnlocked() { return true; }
   validateLoadout() {
     for (const slot of Object.keys(CATALOG)) {
       if (!this.isUnlocked(slot, this.loadout[slot]) || !CATALOG[slot].some((x) => x.id === this.loadout[slot])) this.loadout[slot] = DEFAULT_LOADOUT[slot];
@@ -5089,7 +6147,7 @@ class Profile {
     let xpGained = 150 + (won ? 100 : 0) + Math.round((stats?.score || 0) * 0.6) + (mvp ? 50 : 0);
     this.xp += xpGained;
     const levelUps = [];
-    while (this.xp >= xpToNext(this.level)) { this.xp -= xpToNext(this.level); this.level++; levelUps.push({ level: this.level, unlocks: unlocksAt(this.level) }); }
+    while (this.xp >= xpToNext(this.level)) { this.xp -= xpToNext(this.level); this.level++; levelUps.push({ level: this.level, unlocks: [] }); }
     this.history.unshift({ at: Date.now(), mode: modeLabel, score, team, won, stats, online });
     this.save();
     return { xpGained, levelUps };
@@ -5294,7 +6352,7 @@ function getRoom() {
 
 // ------------------------------------------------------------------ host side
 class RoomHost {
-  constructor({ room, mode, isPrivate, fill, arena, code }) {
+  constructor({ room, mode, game, isPrivate, fill, arena, code }) {
     this.room = room;
     this.code = code || makeCode();
     this.peerToPid = new Map();
@@ -5304,7 +6362,7 @@ class RoomHost {
     this.dirty = true;
     this.chatSeq = 0;
     this.host = new MatchHost({
-      mode, isPrivate, fill, code: this.code, kind: 'browser', arena,
+      mode, game, isPrivate, fill, code: this.code, kind: 'browser', arena,
       out: (target, msg) => this.onOut(target, msg),
     });
     this.local = localPair(this.host);
@@ -5324,8 +6382,8 @@ class RoomHost {
     const s = this.slots;
     switch (msg.t) {
       case 'welcome': { const peer = this.pidToPeer.get(msg.pid) || this.pendingPeer; if (peer) s.ws[peer] = [msg.pid, msg.token, msg.code, msg.mode, msg.priv ? 1 : 0]; break; }
-      case 'lobby': s.lb = [msg.v, msg.phase, msg.owner, msg.fill, msg.startsIn == null ? -1 : Math.round(msg.startsIn), msg.players.map((p) => [p.pid, p.name, p.team, p.ready ? 1 : 0, p.bot ? 1 : 0, p.conn ? 1 : 0, p.rematch ? 1 : 0, p.ping | 0]), msg.mode, msg.priv ? 1 : 0]; break;
-      case 'start': s.st = [msg.mid, msg.seed, msg.mode, msg.duration, packRoster(msg.roster), msg.arena || 'stadium']; break;
+      case 'lobby': s.lb = [msg.v, msg.phase, msg.owner, msg.fill, msg.startsIn == null ? -1 : Math.round(msg.startsIn), msg.players.map((p) => [p.pid, p.name, p.team, p.ready ? 1 : 0, p.bot ? 1 : 0, p.conn ? 1 : 0, p.rematch ? 1 : 0, p.ping | 0]), msg.mode, msg.priv ? 1 : 0, msg.game, msg.arena]; break;
+      case 'start': s.st = [msg.mid, msg.seed, msg.mode, msg.duration, packRoster(msg.roster), msg.arena || 'stadium', msg.game || 'soccar']; break;
       case 'snap': s.sn = msg.s; s.ak = msg.a; break;
       case 'stats': s.ss = [msg.mid, packStats(msg.stats), msg.ping, msg.conn]; break;
       case 'end': s.en = [msg.mid, msg.score, msg.winner, msg.overtime ? 1 : 0, packStats(msg.stats), packRoster(msg.roster)]; break;
@@ -5399,7 +6457,7 @@ class RoomHost {
     // public matchmaking advert in the shared lobby room
     const h = this.host;
     const open = !h.isPrivate && (h.phase === 'lobby' || h.phase === 'match') && h.humans().length < h.capacity();
-    mainRoom.presence({ mm: open ? { code: this.code, mode: h.mode, n: h.connectedHumans().length, cap: h.capacity(), ph: h.phase } : null }).catch(() => {});
+    mainRoom.presence({ mm: open ? { code: this.code, mode: h.game + ':' + h.mode, n: h.connectedHumans().length, cap: h.capacity(), ph: h.phase } : null }).catch(() => {});
   }
   close() {
     this.closed = true;
@@ -5487,20 +6545,20 @@ class RoomClientConn {
     if (!this.pid) return;
     if (Array.isArray(pr.lb) && pr.lb[0] !== seen.lb) {
       seen.lb = pr.lb[0];
-      const [v, phase, owner, fill, startsIn, players, mode, priv] = pr.lb;
-      S.receive({ t: 'lobby', v, phase, owner, fill, startsIn: startsIn < 0 ? null : startsIn, mode, priv: !!priv, kind: 'browser', code: this.code,
+      const [v, phase, owner, fill, startsIn, players, mode, priv, game, arena] = pr.lb;
+      S.receive({ t: 'lobby', v, phase, owner, fill, startsIn: startsIn < 0 ? null : startsIn, mode, game, arena, priv: !!priv, kind: 'browser', code: this.code,
         players: players.map((p) => ({ pid: p[0], name: p[1], team: p[2], ready: !!p[3], bot: !!p[4], conn: !!p[5], rematch: !!p[6], ping: p[7] })) });
     }
     if (Array.isArray(pr.st) && pr.st[0] !== seen.st) {
       seen.st = pr.st[0];
       const roster = unpackRoster(pr.st[4]);
-      S.receive({ t: 'start', mid: pr.st[0], seed: pr.st[1], mode: pr.st[2], duration: pr.st[3], roster, arena: pr.st[5] || null, kind: 'browser' });
+      S.receive({ t: 'start', mid: pr.st[0], seed: pr.st[1], mode: pr.st[2], duration: pr.st[3], roster, arena: pr.st[5] || null, game: pr.st[6] || 'soccar', kind: 'browser' });
       // lobby phase implied by a running match
       if (S.lobby) S.lobby = { ...S.lobby, phase: 'match' };
       else S.lobby = { phase: 'match', players: roster.map((r) => ({ ...r, ready: true, conn: true })), code: this.code, kind: 'browser' };
     }
     if (Array.isArray(pr.sn) && pr.sn[0] !== seen.snapTick) { seen.snapTick = pr.sn[0]; S.receive({ t: 'snap', s: pr.sn, a: pr.ak || {} }); }
-    if (Array.isArray(pr.ss)) { const k = JSON.stringify(pr.ss[2]) + pr.ss[0]; if (k !== seen.ss) { seen.ss = k; S.receive({ t: 'stats', mid: pr.ss[0], stats: unpackStats(pr.ss[1]), ping: pr.ss[2], conn: pr.ss[3], roster: S.roster }); } }
+    if (Array.isArray(pr.ss)) { const k = JSON.stringify(pr.ss[1]) + JSON.stringify(pr.ss[2]) + pr.ss[0]; if (k !== seen.ss) { seen.ss = k; S.receive({ t: 'stats', mid: pr.ss[0], stats: unpackStats(pr.ss[1]), ping: pr.ss[2], conn: pr.ss[3], roster: S.roster }); } }
     if (Array.isArray(pr.en) && pr.en[0] !== seen.en) {
       seen.en = pr.en[0];
       S.receive({ t: 'end', mid: pr.en[0], score: pr.en[1], winner: pr.en[2], overtime: !!pr.en[3], stats: unpackStats(pr.en[4]), roster: unpackRoster(pr.en[5]), kind: 'browser' });
@@ -5537,7 +6595,7 @@ async function findPublicMatch(room, mode, onStatus, waitMs = 3500) {
 function shouldYield(room, myHost) {
   if (myHost.host.isPrivate || myHost.host.connectedHumans().length > 1 || myHost.host.phase !== 'lobby') return null;
   const me = room.peers().find((p) => p.sameTab);
-  const rivals = room.peers().filter((p) => !p.sameTab && p.presence?.mm && p.presence.mm.mode === myHost.host.mode && p.presence.mm.ph === 'lobby' && p.presence.mm.n < p.presence.mm.cap);
+  const rivals = room.peers().filter((p) => !p.sameTab && p.presence?.mm && p.presence.mm.mode === myHost.host.game + ':' + myHost.host.mode && p.presence.mm.ph === 'lobby' && p.presence.mm.n < p.presence.mm.cap);
   const winner = rivals.find((p) => me && p.peer < me.peer);
   return winner ? winner.presence.mm.code : null;
 }
@@ -5640,6 +6698,7 @@ class HUD {
     this.root = h('div', { class: 'hud' });
     this.bug = h('div', { class: 'scorebug' }, this.sb = h('div', { class: 'sc b' }, '0'), this.clock = h('div', { class: 'clock' }, '5:00'), this.so = h('div', { class: 'sc o' }, '0'));
     this.pips = h('div', { class: 'pips' }, this.pipB = h('div', { class: 'side' }), this.pipO = h('div', { class: 'side' }));
+    this.hint = h('div', { class: 'board-hint' }, 'Hold TAB · Scoreboard');
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('viewBox', '0 0 170 170');
     const mk = (attrs) => { const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle'); for (const k in attrs) c.setAttribute(k, attrs[k]); svg.appendChild(c); return c; };
@@ -5656,7 +6715,7 @@ class HUD {
     this.drill = h('div', { class: 'drillbox hidden' });
     this.qc = h('div', { class: 'quickchat hidden' }, QUICK_CHAT.slice(0, 9).map((t, i) => h('div', null, h('b', null, i + 1), t)), h('div', { class: 'muted small' }, 'Press a number · T to close'));
     this.board = h('div', { class: 'overlay hidden', style: { pointerEvents: 'none', background: 'rgba(3,5,10,0.35)' } });
-    this.root.append(this.bug, this.pips, this.boost, this.center, this.goal, this.net, this.feed, this.mid, this.replay, this.drill, this.qc, this.board);
+    this.root.append(this.bug, this.pips, this.hint, this.boost, this.center, this.goal, this.net, this.feed, this.mid, this.replay, this.drill, this.qc, this.board);
   }
 
   set(el, key, val, fn) { if (this.cache[key] !== val) { this.cache[key] = val; fn(val); } }
@@ -5667,6 +6726,8 @@ class HUD {
     const training = st.kind === 'training';
     this.bug.classList.toggle('hidden', training);
     this.pips.classList.toggle('hidden', training);
+    const key = (app.input?.binds?.kb?.scoreboard?.[0] || 'Tab').replace(/^Key/, '').replace(/^b(\d+)$/, 'pad $1').toUpperCase();
+    this.set(this.hint, 'hint', training ? '' : `Hold ${key} · Scoreboard`, (v) => { this.hint.textContent = v; this.hint.classList.toggle('hidden', !v); });
     this.drill.classList.toggle('hidden', !training);
     if (!training) {
       this.set(this.sb, 'sb', st.score[0], (v) => { this.sb.textContent = v; });
@@ -5767,7 +6828,7 @@ __m["client/ui/screens.js"] = (() => {
 // Menu screens: main, play, private match, practice, training, matchmaking, lobby, results,
 // profile, statistics, credits, exit.
 const { h, clear, seg, toast, bannerStyle, fmtDuration } = __m["client/ui/dom.js"];
-const { MODES, BOTS, TEAM_COLORS } = __m["shared/config.js"];
+const { MODES, BOTS, TEAM_COLORS, GAME_MODES, ARENA_VARIANTS, arenasForMode } = __m["shared/config.js"];
 const { CODE_RE } = __m["shared/protocol.js"];
 const { DRILLS } = __m["client/training.js"];
 const { ARENA_THEMES } = __m["client/render/arenaMesh.js"];
@@ -5816,6 +6877,30 @@ function mainMenu(app) {
   return { el };
 }
 
+// Game mode selector (Soccar / Hoops / Dropshot) with a one-line description.
+function gamePicker(app, key, onChange) {
+  const blurb = h('div', { class: 'small muted' }, GAME_MODES[app.prefs[key]]?.blurb || '');
+  return h('div', { class: 'col' },
+    seg(Object.entries(GAME_MODES).map(([id, g]) => [id, g.name]), app.prefs[key], (v) => { app.prefs[key] = v; app.savePrefs(); blurb.textContent = GAME_MODES[v].blurb; onChange?.(v); }),
+    blurb);
+}
+
+// Arena picker filtered to the maps of the selected game mode; re-renders when the mode changes.
+function arenaPicker(app, key, gameKey, competitiveOnly = false) {
+  const box = h('div', { class: 'col' });
+  const render = () => {
+    clear(box);
+    const game = app.prefs[gameKey] || 'soccar';
+    const ids = arenasForMode(game).filter((id) => !competitiveOnly || ARENA_VARIANTS[id].competitive);
+    if (!ids.includes(app.prefs[key])) { app.prefs[key] = ids[0]; app.savePrefs(); }
+    const blurb = h('div', { class: 'small muted' }, ARENA_THEMES[app.prefs[key]]?.blurb || '');
+    box.append(seg(ids.map((id) => [id, ARENA_VARIANTS[id].name]), app.prefs[key], (v) => { app.prefs[key] = v; app.savePrefs(); blurb.textContent = ARENA_THEMES[v]?.blurb || ''; }), blurb);
+  };
+  render();
+  box.refresh = render;
+  return box;
+}
+
 function playMenu(app) {
   const st = app.prefs;
   const modeSel = (key) => seg(Object.keys(MODES).map((m) => [m, m]), st[key], (v) => { st[key] = v; app.savePrefs(); });
@@ -5823,25 +6908,23 @@ function playMenu(app) {
   const el = h('div', { class: 'screen solid' },
     h('div', { class: 'topbar' }, back(app), h('h1', null, 'Play'), h('div', { class: 'spacer' }), h('div', { class: 'crumb' }, online ? (app.net.server ? 'Dedicated server' : 'Browser-hosted (shared link)') : 'Offline')),
     h('div', { class: 'tiles' },
-      h('div', { class: 'panel tile' + (online ? '' : ' locked') },
+      h('div', { class: 'panel tile wide' + (online ? '' : ' locked') },
         h('div', { class: 'tag' }, online ? 'Online' : 'Unavailable'),
         h('div', { class: 't' }, 'Casual'),
-        h('p', null, online ? 'Public matchmaking. Empty seats are filled by labelled bots, and players can drop in.' : 'Needs the dedicated server or the shared claude.ai link. Use Practice for offline play.'),
-        h('div', { class: 'row', style: { marginTop: '12px' } }, modeSel('casualMode'),
-          h('button', { class: 'btn primary', disabled: !online, onclick: () => { app.uiClick(); app.playOnline(st.casualMode); } }, 'Find match'))),
-      h('div', { class: 'panel tile locked' },
-        h('div', { class: 'tag' }, 'Requires ranking service'),
-        h('div', { class: 't' }, 'Competitive'),
-        h('p', null, 'Ranked play needs authenticated accounts and a rating service, which this build does not include. See the README for the plan.')),
+        h('p', null, online ? 'Public matchmaking in Soccar, Hoops or Dropshot. Empty seats are filled by labelled bots, and players can drop in.' : 'Needs the dedicated server or the shared claude.ai link. Use Practice for offline play.'),
+        h('div', { class: 'col', style: { marginTop: '12px', gap: '10px' } },
+          gamePicker(app, 'casualGame'),
+          h('div', { class: 'row' }, modeSel('casualMode'),
+            h('button', { class: 'btn primary', disabled: !online, onclick: () => { app.uiClick(); app.playOnline(st.casualMode, st.casualGame); } }, 'Find match')))),
       h('div', { class: 'panel tile' + (online ? '' : ' locked'), onclick: (e) => { if (online && !e.target.closest('button')) app.go('private'); } },
         h('div', { class: 'tag' }, 'Online · Friends'),
         h('div', { class: 't' }, 'Private Match'),
-        h('p', null, 'Create a lobby and share its 6-character code, or join a friend with theirs.'),
+        h('p', null, 'Pick a mode and arena, then share your 6-character code, or join a friend with theirs.'),
         h('div', { class: 'row', style: { marginTop: '12px' } }, h('button', { class: 'btn', disabled: !online, onclick: () => app.go('private') }, 'Create / Join'))),
       h('div', { class: 'panel tile', onclick: (e) => { if (!e.target.closest('button')) app.go('practice'); } },
         h('div', { class: 'tag' }, 'Offline'),
         h('div', { class: 't' }, 'Practice vs Bots'),
-        h('p', null, 'Full match against AI teammates and opponents. Runs entirely on this device.'),
+        h('p', null, 'Any mode on any arena against AI teammates and opponents. Runs entirely on this device.'),
         h('div', { class: 'row', style: { marginTop: '12px' } }, h('button', { class: 'btn', onclick: () => app.go('practice') }, 'Set up'))),
       h('div', { class: 'panel tile', onclick: () => app.go('training') },
         h('div', { class: 'tag' }, 'Offline'),
@@ -5850,23 +6933,19 @@ function playMenu(app) {
   return { el };
 }
 
-function arenaPicker(app, key, allowExperimental) {
-  const opts = Object.values(ARENA_THEMES).filter((a) => allowExperimental || !a.params).map((a) => [a.id, a.name]);
-  const blurb = h('div', { class: 'small muted' }, ARENA_THEMES[app.prefs[key]]?.blurb || '');
-  return h('div', { class: 'col' }, seg(opts, app.prefs[key], (v) => { app.prefs[key] = v; app.savePrefs(); blurb.textContent = ARENA_THEMES[v].blurb; }), blurb);
-}
-
 function practiceMenu(app) {
   const p = app.prefs;
+  const arenas = arenaPicker(app, 'practiceArena', 'practiceGame');
   const el = h('div', { class: 'screen solid' },
     h('div', { class: 'topbar' }, back(app, 'play'), h('h1', null, 'Practice vs Bots'), h('div', { class: 'spacer' }), h('div', { class: 'crumb' }, 'Offline · not an online match')),
-    h('div', { class: 'panel', style: { maxWidth: '760px' } },
+    h('div', { class: 'panel', style: { maxWidth: '820px' } },
       h('div', { class: 'col', style: { gap: '18px' } },
+        h('div', null, h('h3', null, 'Game mode'), gamePicker(app, 'practiceGame', () => arenas.refresh())),
         h('div', null, h('h3', null, 'Format'), seg(Object.keys(MODES).map((m) => [m, MODES[m].label]), p.practiceMode, (v) => { p.practiceMode = v; app.savePrefs(); })),
         h('div', null, h('h3', null, 'Bot difficulty'), seg(Object.entries(BOTS).map(([k, b]) => [k, b.label]), p.practiceBots, (v) => { p.practiceBots = v; app.savePrefs(); })),
-        h('div', null, h('h3', null, 'Arena'), arenaPicker(app, 'practiceArena', true)),
+        h('div', null, h('h3', null, 'Arena'), arenas),
         h('div', null, h('h3', null, 'Match length'), seg([[120, '2 min'], [300, '5 min'], [600, '10 min']], p.practiceLength, (v) => { p.practiceLength = v; app.savePrefs(); })),
-        h('div', { class: 'row' }, h('button', { class: 'btn primary', onclick: () => { app.uiClick(); app.practice({ mode: p.practiceMode, difficulty: p.practiceBots, arena: p.practiceArena, duration: p.practiceLength }); } }, 'Start match')))));
+        h('div', { class: 'row' }, h('button', { class: 'btn primary', onclick: () => { app.uiClick(); app.practice({ mode: p.practiceMode, game: p.practiceGame, difficulty: p.practiceBots, arena: p.practiceArena, duration: p.practiceLength }); } }, 'Start match')))));
   return { el };
 }
 
@@ -5880,17 +6959,19 @@ function privateMenu(app) {
     app.joinPrivate(c);
   };
   codeIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') join(); });
+  const privArenas = arenaPicker(app, 'privateArena', 'privateGame');
   const el = h('div', { class: 'screen solid' },
     h('div', { class: 'topbar' }, back(app, 'play'), h('h1', null, 'Private Match')),
     h('div', { class: 'lobby-grid', style: { maxWidth: '1100px' } },
       h('div', { class: 'panel' },
         h('h2', null, 'Create'),
         h('div', { class: 'col', style: { gap: '16px' } },
+          h('div', null, h('h3', null, 'Game mode'), gamePicker(app, 'privateGame', () => privArenas.refresh())),
           h('div', null, h('h3', null, 'Format'), seg(Object.keys(MODES).map((m) => [m, m]), p.privateMode, (v) => { p.privateMode = v; app.savePrefs(); })),
           h('div', null, h('h3', null, 'Fill empty seats with bots'), seg([['off', 'No bots'], ['rookie', 'Rookie'], ['pro', 'Pro'], ['elite', 'Elite']], p.privateFill, (v) => { p.privateFill = v; app.savePrefs(); })),
-          h('div', null, h('h3', null, 'Arena'), arenaPicker(app, 'privateArena', true)),
+          h('div', null, h('h3', null, 'Arena'), privArenas),
           app.net.room && !app.net.server ? h('p', { class: 'small muted' }, 'Your browser will host this match. Keep this tab open and in the foreground while playing; friends join with the code from this same shared link.') : null,
-          h('button', { class: 'btn primary', onclick: () => { app.uiClick(); app.createPrivate({ mode: p.privateMode, fill: p.privateFill, arena: p.privateArena }); } }, 'Create lobby'))),
+          h('button', { class: 'btn primary', onclick: () => { app.uiClick(); app.createPrivate({ mode: p.privateMode, game: p.privateGame, fill: p.privateFill, arena: p.privateArena }); } }, 'Create lobby'))),
       h('div', { class: 'panel' },
         h('h2', null, 'Join'),
         h('div', { class: 'col', style: { gap: '16px' } },
@@ -6034,7 +7115,7 @@ function profileScreen(app) {
       h('div', { class: 'panel' },
         h('h2', null, 'Account type'),
         h('p', null, h('b', null, 'Local profile.'), ' Your progress, unlocks and settings are stored in this browser only. There is no sign-in, cloud save or cross-device sync in this build.'),
-        h('p', { class: 'muted small' }, 'Cosmetics are unlocked by levelling up from completed matches. Nothing can be purchased and there are no randomised rewards.'),
+        h('p', { class: 'muted small' }, 'Every cosmetic is unlocked from the start. Nothing can be purchased and there are no randomised rewards.'),
         h('p', { class: 'muted small' }, `Created ${new Date(p.created).toLocaleDateString()} · storage: ${app.storePersistent ? 'persistent' : 'session only (browser blocked storage)'}`),
         h('div', { class: 'row', style: { marginTop: '16px' } }, h('button', { class: 'btn danger sm', onclick: () => app.confirm('Reset profile?', 'This deletes your level, statistics and cosmetics on this device.', () => app.resetProfile()) }, 'Reset profile')))));
   return { el };
@@ -6115,6 +7196,8 @@ function settingsScreen(app, params = {}) {
     video: () => [
       row('Display mode', 'Fullscreen uses the browser fullscreen API', choice('displayMode', [['windowed', 'Windowed'], ['fullscreen', 'Fullscreen']])),
       row('Graphics quality', 'Shadows, particle density, pixel ratio, crowd detail', choice('quality', [['low', 'Low'], ['medium', 'Medium'], ['high', 'High']])),
+      row('Post-processing', 'Bloom, filmic tone mapping, colour grading, vignette and film grain', tog('postFx')),
+      row('Speed effects', 'Subtle edge fringing at supersonic speed', tog('speedFx')),
       row('Resolution scale', 'Internal render resolution relative to the window', slider('renderScale', 0.5, 1.5, 0.05, (v) => Math.round(v * 100) + '%')),
       row('Frame-rate limit', '0 = match the display refresh', slider('fpsLimit', 0, 240, 30, (v) => (v ? v + ' fps' : 'Display'))),
       row('V-sync', 'Browsers always present frames on the display refresh; this cannot be disabled from a web page', h('span', { class: 'muted small' }, 'Always on (browser-controlled)')),
@@ -6310,7 +7393,7 @@ function garageScreen(app, params = {}) {
     h('div', { class: 'topbar', style: { padding: '22px 28px 0', marginBottom: 0 } },
       h('button', { class: 'btn ghost', onclick: () => { if (dirty()) app.confirm('Discard changes?', 'You have unsaved customisation changes.', () => { app.go('main'); }); else app.go('main'); } }, '← Back'),
       h('h1', null, params.tab && params.tab !== 'body' ? 'Customise' : 'Garage'), h('div', { class: 'spacer' }),
-      h('div', { class: 'crumb' }, `Level ${prof.level} · locked items unlock as you level up`)),
+      h('div', { class: 'crumb' }, `Everything unlocked · ${Object.values(CATALOG).reduce((n, l) => n + l.length, 0)} items`)),
     h('div', { class: 'garage' }, cats, stage, items));
   return { el, leave() { app.renderer.setShowroomCar(prof.loadout, 0); } };
 }
@@ -6336,7 +7419,7 @@ __m["client/main.js"] = (() => {
 // Project Overdrive — client application: screen flow, sessions (online/offline/training),
 // main loop, presentation of simulation events, replays, progression.
 const THREE = __m["three"];
-const { TEAM_COLORS, TEAM_COLORS_ALT, MODES, ARENA_VARIANTS, PHYSICS, BALL } = __m["shared/config.js"];
+const { TEAM_COLORS, TEAM_COLORS_ALT, MODES, ARENA_VARIANTS, GAME_MODES, arenasForMode, PHYSICS, BALL } = __m["shared/config.js"];
 const { ClientSession, localPair } = __m["shared/client.js"];
 const { MatchHost } = __m["shared/host.js"];
 const { wsConnect } = __m["shared/wsconn.js"];
@@ -6357,7 +7440,7 @@ const { settingsScreen } = __m["client/ui/settings.js"];
 const { garageScreen } = __m["client/ui/garage.js"];
 
 setQuiet(true);
-const DEFAULT_PREFS = { casualMode: '3v3', practiceMode: '3v3', practiceBots: 'pro', practiceArena: 'stadium', practiceLength: 300, privateMode: '3v3', privateFill: 'off', privateArena: 'stadium', serverUrl: '' };
+const DEFAULT_PREFS = { casualGame: 'soccar', practiceGame: 'soccar', privateGame: 'soccar', casualMode: '3v3', practiceMode: '3v3', practiceBots: 'pro', practiceArena: 'stadium', practiceLength: 300, privateMode: '3v3', privateFill: 'off', privateArena: 'stadium', serverUrl: '' };
 const _p = new V3(), _q = new Quat();
 
 class Replay {
@@ -6493,7 +7576,7 @@ class App {
   applySettings(key) {
     const s = this.settings;
     saveSettings(s);
-    if (key === 'quality' || key === 'renderScale' || key === '*') this.renderer.applyQuality(s.quality);
+    if (key === 'quality' || key === 'renderScale' || key === 'postFx' || key === '*') this.renderer.applyQuality(s.quality);
     if (key.startsWith?.('vol') || key === '*') this.audio.applyVolumes();
     if (key === 'uiScale' || key === '*') document.documentElement.style.setProperty('--ui-scale', s.uiScale);
     if (key === 'colorblind' || key === '*') {
@@ -6530,9 +7613,9 @@ class App {
     return S;
   }
 
-  playOnline(mode) {
+  playOnline(mode, game = 'soccar') {
     if (this.net.server) {
-      const conn = wsConnect(`${this.serverWsBase()}?op=queue&mode=${mode}`);
+      const conn = wsConnect(`${this.serverWsBase()}?op=queue&mode=${mode}&game=${game}`);
       this.beginClient(conn, { online: true, via: 'server' });
       return;
     }
@@ -6541,10 +7624,13 @@ class App {
       this.mode = 'searching';
       this.go('searching', { mode });
       const token = (this.searchToken = {});
-      findPublicMatch(this.room, mode, (st) => { this.searchStatus = `${st.searching} player(s) searching nearby`; }).then((r) => {
+      findPublicMatch(this.room, game + ':' + mode, (st) => { this.searchStatus = `${st.searching} player(s) searching nearby`; }).then((r) => {
         if (this.searchToken !== token) return;
         if (r.join) this.joinRoom(r.join, { online: true });
-        else this.hostRoom({ mode, isPrivate: false, fill: 'pro', arena: 'stadium' });
+        else {
+          const maps = arenasForMode(game).filter((id) => ARENA_VARIANTS[id].competitive);
+          this.hostRoom({ mode, game, isPrivate: false, fill: 'pro', arena: maps[Math.floor(Math.random() * maps.length)] });
+        }
       });
       return;
     }
@@ -6552,9 +7638,9 @@ class App {
   }
   cancelSearch() { this.searchToken = null; this.room?.presence({ seek: null }).catch(() => {}); this.mode = 'menu'; this.go('play'); }
 
-  createPrivate({ mode, fill, arena }) {
-    if (this.net.server) { this.beginClient(wsConnect(`${this.serverWsBase()}?op=create&mode=${mode}&fill=${fill}&arena=${arena}`), { online: true, via: 'server' }); return; }
-    if (this.room) { this.hostRoom({ mode, isPrivate: true, fill, arena }); return; }
+  createPrivate({ mode, game, fill, arena }) {
+    if (this.net.server) { this.beginClient(wsConnect(`${this.serverWsBase()}?op=create&mode=${mode}&game=${game}&fill=${fill}&arena=${arena}`), { online: true, via: 'server' }); return; }
+    if (this.room) { this.hostRoom({ mode, game, isPrivate: true, fill, arena }); return; }
     toast('Private matches need the dedicated server or the shared link.', 'err');
   }
   joinPrivate(code) {
@@ -6562,9 +7648,9 @@ class App {
     if (this.room) { this.joinRoom(code, { online: true }); return; }
     toast('Joining needs the dedicated server or the shared link.', 'err');
   }
-  async hostRoom({ mode, isPrivate, fill, arena }) {
+  async hostRoom({ mode, game, isPrivate, fill, arena }) {
     try {
-      const rh = new RoomHost({ room: this.room, mode, isPrivate, fill, arena });
+      const rh = new RoomHost({ room: this.room, mode, game, isPrivate, fill, arena });
       await rh.open();
       const S = this.beginClient(rh.local.conn, { online: true, via: 'room-host' });
       rh.local.attach(S);
@@ -6582,8 +7668,8 @@ class App {
     try { await conn.open(); } catch (e) { toast('Could not reach that match.', 'err'); this.leaveSession(); }
   }
 
-  practice({ mode, difficulty, arena, duration }) {
-    const host = new MatchHost({ mode, kind: 'offline', isPrivate: true, fill: difficulty, autoStart: true, duration, arena });
+  practice({ mode, game, difficulty, arena, duration }) {
+    const host = new MatchHost({ mode, game, kind: 'offline', isPrivate: true, fill: difficulty, autoStart: true, duration, arena });
     const pair = localPair(host);
     host.out = (target, msg) => pair.deliver(target, msg);
     const S = this.beginClient(pair.conn, { online: false, via: 'offline' });
@@ -6795,7 +7881,7 @@ class App {
     this.viewBall.pos.set(_p.x, _p.y, _p.z);
     this.viewBall.hidden = W.ballHidden;
     this.viewBall.angVel = W.ball.angVel;
-    this.view = { cars, ball: this.viewBall, pads: W.pads };
+    this.view = { cars, ball: this.viewBall, pads: W.pads, tiles: W.tiles, drop: W.drop };
   }
 
   drawWorld(dt, now, myPid, W, ui) {
@@ -6803,7 +7889,7 @@ class App {
     let view = this.view;
     const rep = this.replay.playing ? this.replay.frame(now) : null;
     if (rep) {
-      view = { cars: rep.cars, ball: rep.ball, pads: W.pads };
+      view = { cars: rep.cars, ball: rep.ball, pads: W.pads, tiles: W.tiles, drop: null };
       R.rig.cinematic(dt, rep.ball.pos, s, rep.ball.pos.x > 0 ? -1 : 1);
     } else {
       const mine = view.cars.find((c) => c.id === myPid);
@@ -6876,6 +7962,8 @@ class App {
         case 'bump': A.play('bump', { pos: carPos(e.a), strength: e.speed }); if (e.a === myPid || e.b === myPid) R.rig?.addShake(Math.min(1, e.speed / 12), this.settings); break;
         case 'pickup': { const pad = (this.session?.world || this.training?.world).arena.pads[e.pad]; R.pickup(pad, e.large); if (e.car === myPid) A.play('pickup', { large: e.large }); break; }
         case 'boostOff': if (e.car === myPid && e.empty) A.play('boostEmpty'); break;
+        case 'tiles': R.tileBreak(e); A.play('ballWall', { pos: { x: e.x, y: 0.5, z: e.z }, strength: 10 + e.level * 6 }); break;
+        case 'charge': A.play('pickup', { large: e.level >= 3 }); break;
         case 'respawn': { const c = this.view?.cars.find((x) => x.id === e.car); const car = (this.session?.world || this.training?.world)?.car(e.car); if (car) R.respawnFx(car.pos, car.team); void c; break; }
         default: break;
       }

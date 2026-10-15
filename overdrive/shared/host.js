@@ -6,7 +6,7 @@
 // client messages to handle(pid, msg), calls tick() at PHYSICS.tickRate, and delivers what
 // it receives through out(pid | null, msg)   (null = broadcast).
 
-import { PHYSICS, NET, MODES, MATCH, BOT_NAMES, ARENA_VARIANTS } from './config.js';
+import { PHYSICS, NET, MODES, MATCH, BOT_NAMES, ARENA_VARIANTS, GAME_MODES, arenasForMode } from './config.js';
 import { World, unpackInput, quantizeInput } from './world.js';
 import { Bot } from './bot.js';
 import { neutralInput } from './car.js';
@@ -29,8 +29,12 @@ export class MatchHost {
     this.fill = opts.fill || (this.isPrivate ? 'off' : 'pro'); // bot fill level
     this.autoStart = !!opts.autoStart;           // offline: start as soon as the creator joins
     this.lobbyTimeout = opts.lobbyTimeout ?? 25; // public lobbies start after this many seconds
-    this.arena = ARENA_VARIANTS[opts.arena] ? opts.arena : 'stadium';
-    if (!this.isPrivate && this.kind !== 'offline' && !ARENA_VARIANTS[this.arena].competitive) this.arena = 'stadium';
+    // game mode (soccar / hoops / dropshot) and an arena that belongs to it
+    this.game = GAME_MODES[opts.game] ? opts.game : (ARENA_VARIANTS[opts.arena]?.mode || 'soccar');
+    const maps = arenasForMode(this.game);
+    const publicPlay = !this.isPrivate && this.kind !== 'offline';
+    const ok = (id) => ARENA_VARIANTS[id] && ARENA_VARIANTS[id].mode === this.game && (!publicPlay || ARENA_VARIANTS[id].competitive);
+    this.arena = ok(opts.arena) ? opts.arena : maps.find((id) => ok(id)) || 'stadium';
     this.arenaParams = ARENA_VARIANTS[this.arena].params;
     this.players = new Map();                    // pid -> player
     this.nextPid = 1;
@@ -94,7 +98,7 @@ export class MatchHost {
   }
 
   afterJoin(p) {
-    this.out(p.pid, { t: 'welcome', pid: p.pid, token: p.token, code: this.code, mode: this.mode, kind: this.kind, priv: this.isPrivate });
+    this.out(p.pid, { t: 'welcome', pid: p.pid, token: p.token, code: this.code, mode: this.mode, game: this.game, arena: this.arena, kind: this.kind, priv: this.isPrivate });
     this.bumpLobby();
     if (this.world) {
       this.out(p.pid, this.startMsg());
@@ -212,12 +216,12 @@ export class MatchHost {
     }));
     const left = this.phase === 'lobby' && !this.isPrivate && this.kind !== 'offline'
       ? Math.max(0, this.lobbyTimeout - this.phaseTicks * TICK) : null;
-    return { t: 'lobby', v: this.lobbyVersion, code: this.code, mode: this.mode, phase: this.phase, priv: this.isPrivate, kind: this.kind, owner: this.ownerPid, fill: this.fill, players, startsIn: left };
+    return { t: 'lobby', v: this.lobbyVersion, code: this.code, mode: this.mode, game: this.game, arena: this.arena, phase: this.phase, priv: this.isPrivate, kind: this.kind, owner: this.ownerPid, fill: this.fill, players, startsIn: left };
   }
 
   startMsg() {
     const roster = [...this.players.values()].map((p) => ({ pid: p.pid, name: p.name, team: p.team, bot: !!p.bot, cos: p.cos }));
-    return { t: 'start', mid: this.mid, seed: this.world.seed, mode: this.mode, duration: this.duration, roster, kind: this.kind, arena: this.arena };
+    return { t: 'start', mid: this.mid, seed: this.world.seed, mode: this.mode, duration: this.duration, roster, kind: this.kind, arena: this.arena, game: this.game };
   }
 
   statsMsg() {

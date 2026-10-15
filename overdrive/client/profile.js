@@ -1,11 +1,11 @@
 // Local player profile (progression, statistics, cosmetics) and persisted settings.
 // This is a LOCAL profile stored on this device — not an authenticated online account.
 import { store } from './store.js';
-import { DEFAULT_LOADOUT, CATALOG, unlockLevel, unlocksAt } from './cosmetics.js';
+import { DEFAULT_LOADOUT, CATALOG } from './cosmetics.js';
 
 export const DEFAULT_SETTINGS = {
   // display
-  quality: 'high', renderScale: 1, fpsLimit: 0, vsync: true, displayMode: 'windowed', showFps: false,
+  quality: 'high', postFx: true, speedFx: true, renderScale: 1, fpsLimit: 0, vsync: true, displayMode: 'windowed', showFps: false,
   // camera
   fov: 108, distance: 3.0, height: 1.05, speedFov: 6, stiffness: 0.45, swivelSpeed: 4.5, transitionSpeed: 1.2, cameraShake: false, ballCamDefault: true,
   // controls
@@ -39,7 +39,8 @@ export class Profile {
   }
   save() { store.set('profile', { name: this.name, level: this.level, xp: this.xp, stats: this.stats, loadout: this.loadout, history: this.history.slice(0, 20), created: this.created }); }
 
-  isUnlocked(slot, id) { return unlockLevel(slot, id) <= this.level; }
+  // Everything is unlocked from the start; levels only track how much you have played.
+  isUnlocked() { return true; }
   validateLoadout() {
     for (const slot of Object.keys(CATALOG)) {
       if (!this.isUnlocked(slot, this.loadout[slot]) || !CATALOG[slot].some((x) => x.id === this.loadout[slot])) this.loadout[slot] = DEFAULT_LOADOUT[slot];
@@ -57,7 +58,7 @@ export class Profile {
     let xpGained = 150 + (won ? 100 : 0) + Math.round((stats?.score || 0) * 0.6) + (mvp ? 50 : 0);
     this.xp += xpGained;
     const levelUps = [];
-    while (this.xp >= xpToNext(this.level)) { this.xp -= xpToNext(this.level); this.level++; levelUps.push({ level: this.level, unlocks: unlocksAt(this.level) }); }
+    while (this.xp >= xpToNext(this.level)) { this.xp -= xpToNext(this.level); this.level++; levelUps.push({ level: this.level, unlocks: [] }); }
     this.history.unshift({ at: Date.now(), mode: modeLabel, score, team, won, stats, online });
     this.save();
     return { xpGained, levelUps };

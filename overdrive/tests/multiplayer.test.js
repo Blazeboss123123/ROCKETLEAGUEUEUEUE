@@ -208,7 +208,10 @@ test('state stays consistent under simulated latency, jitter and loss', async ()
       for (const c of w.cars) {
         const mine = s.world.car(c.id);
         const d = mine.pos.dist(c.pos);
-        assert.ok(d < 1.5, `client view of car ${c.id} within 1.5 m of authority (got ${d.toFixed(3)})`);
+        // views are compared at one wall-clock instant, so a car still rolling (e.g. down a wall) is
+        // legitimately up to one one-way latency of travel apart
+        const tol = 1.5 + c.vel.len() * 0.25;
+        assert.ok(d < tol, `client view of car ${c.id} within ${tol.toFixed(2)} m of authority (got ${d.toFixed(3)}, speed ${c.vel.len().toFixed(1)})`);
       }
       assert.ok(s.rtt > 100, 'latency measured: ' + s.rtt);
     }

@@ -37,7 +37,7 @@ export function getRoom() {
 
 // ------------------------------------------------------------------ host side
 export class RoomHost {
-  constructor({ room, mode, isPrivate, fill, arena, code }) {
+  constructor({ room, mode, game, isPrivate, fill, arena, code }) {
     this.room = room;
     this.code = code || makeCode();
     this.peerToPid = new Map();
@@ -47,7 +47,7 @@ export class RoomHost {
     this.dirty = true;
     this.chatSeq = 0;
     this.host = new MatchHost({
-      mode, isPrivate, fill, code: this.code, kind: 'browser', arena,
+      mode, game, isPrivate, fill, code: this.code, kind: 'browser', arena,
       out: (target, msg) => this.onOut(target, msg),
     });
     this.local = localPair(this.host);
@@ -67,8 +67,8 @@ export class RoomHost {
     const s = this.slots;
     switch (msg.t) {
       case 'welcome': { const peer = this.pidToPeer.get(msg.pid) || this.pendingPeer; if (peer) s.ws[peer] = [msg.pid, msg.token, msg.code, msg.mode, msg.priv ? 1 : 0]; break; }
-      case 'lobby': s.lb = [msg.v, msg.phase, msg.owner, msg.fill, msg.startsIn == null ? -1 : Math.round(msg.startsIn), msg.players.map((p) => [p.pid, p.name, p.team, p.ready ? 1 : 0, p.bot ? 1 : 0, p.conn ? 1 : 0, p.rematch ? 1 : 0, p.ping | 0]), msg.mode, msg.priv ? 1 : 0]; break;
-      case 'start': s.st = [msg.mid, msg.seed, msg.mode, msg.duration, packRoster(msg.roster), msg.arena || 'stadium']; break;
+      case 'lobby': s.lb = [msg.v, msg.phase, msg.owner, msg.fill, msg.startsIn == null ? -1 : Math.round(msg.startsIn), msg.players.map((p) => [p.pid, p.name, p.team, p.ready ? 1 : 0, p.bot ? 1 : 0, p.conn ? 1 : 0, p.rematch ? 1 : 0, p.ping | 0]), msg.mode, msg.priv ? 1 : 0, msg.game, msg.arena]; break;
+      case 'start': s.st = [msg.mid, msg.seed, msg.mode, msg.duration, packRoster(msg.roster), msg.arena || 'stadium', msg.game || 'soccar']; break;
       case 'snap': s.sn = msg.s; s.ak = msg.a; break;
       case 'stats': s.ss = [msg.mid, packStats(msg.stats), msg.ping, msg.conn]; break;
       case 'end': s.en = [msg.mid, msg.score, msg.winner, msg.overtime ? 1 : 0, packStats(msg.stats), packRoster(msg.roster)]; break;
@@ -142,7 +142,7 @@ export class RoomHost {
     // public matchmaking advert in the shared lobby room
     const h = this.host;
     const open = !h.isPrivate && (h.phase === 'lobby' || h.phase === 'match') && h.humans().length < h.capacity();
-    mainRoom.presence({ mm: open ? { code: this.code, mode: h.mode, n: h.connectedHumans().length, cap: h.capacity(), ph: h.phase } : null }).catch(() => {});
+    mainRoom.presence({ mm: open ? { code: this.code, mode: h.game + ':' + h.mode, n: h.connectedHumans().length, cap: h.capacity(), ph: h.phase } : null }).catch(() => {});
   }
   close() {
     this.closed = true;
@@ -230,20 +230,20 @@ export class RoomClientConn {
     if (!this.pid) return;
     if (Array.isArray(pr.lb) && pr.lb[0] !== seen.lb) {
       seen.lb = pr.lb[0];
-      const [v, phase, owner, fill, startsIn, players, mode, priv] = pr.lb;
-      S.receive({ t: 'lobby', v, phase, owner, fill, startsIn: startsIn < 0 ? null : startsIn, mode, priv: !!priv, kind: 'browser', code: this.code,
+      const [v, phase, owner, fill, startsIn, players, mode, priv, game, arena] = pr.lb;
+      S.receive({ t: 'lobby', v, phase, owner, fill, startsIn: startsIn < 0 ? null : startsIn, mode, game, arena, priv: !!priv, kind: 'browser', code: this.code,
         players: players.map((p) => ({ pid: p[0], name: p[1], team: p[2], ready: !!p[3], bot: !!p[4], conn: !!p[5], rematch: !!p[6], ping: p[7] })) });
     }
     if (Array.isArray(pr.st) && pr.st[0] !== seen.st) {
       seen.st = pr.st[0];
       const roster = unpackRoster(pr.st[4]);
-      S.receive({ t: 'start', mid: pr.st[0], seed: pr.st[1], mode: pr.st[2], duration: pr.st[3], roster, arena: pr.st[5] || null, kind: 'browser' });
+      S.receive({ t: 'start', mid: pr.st[0], seed: pr.st[1], mode: pr.st[2], duration: pr.st[3], roster, arena: pr.st[5] || null, game: pr.st[6] || 'soccar', kind: 'browser' });
       // lobby phase implied by a running match
       if (S.lobby) S.lobby = { ...S.lobby, phase: 'match' };
       else S.lobby = { phase: 'match', players: roster.map((r) => ({ ...r, ready: true, conn: true })), code: this.code, kind: 'browser' };
     }
     if (Array.isArray(pr.sn) && pr.sn[0] !== seen.snapTick) { seen.snapTick = pr.sn[0]; S.receive({ t: 'snap', s: pr.sn, a: pr.ak || {} }); }
-    if (Array.isArray(pr.ss)) { const k = JSON.stringify(pr.ss[2]) + pr.ss[0]; if (k !== seen.ss) { seen.ss = k; S.receive({ t: 'stats', mid: pr.ss[0], stats: unpackStats(pr.ss[1]), ping: pr.ss[2], conn: pr.ss[3], roster: S.roster }); } }
+    if (Array.isArray(pr.ss)) { const k = JSON.stringify(pr.ss[1]) + JSON.stringify(pr.ss[2]) + pr.ss[0]; if (k !== seen.ss) { seen.ss = k; S.receive({ t: 'stats', mid: pr.ss[0], stats: unpackStats(pr.ss[1]), ping: pr.ss[2], conn: pr.ss[3], roster: S.roster }); } }
     if (Array.isArray(pr.en) && pr.en[0] !== seen.en) {
       seen.en = pr.en[0];
       S.receive({ t: 'end', mid: pr.en[0], score: pr.en[1], winner: pr.en[2], overtime: !!pr.en[3], stats: unpackStats(pr.en[4]), roster: unpackRoster(pr.en[5]), kind: 'browser' });
@@ -280,7 +280,7 @@ export async function findPublicMatch(room, mode, onStatus, waitMs = 3500) {
 export function shouldYield(room, myHost) {
   if (myHost.host.isPrivate || myHost.host.connectedHumans().length > 1 || myHost.host.phase !== 'lobby') return null;
   const me = room.peers().find((p) => p.sameTab);
-  const rivals = room.peers().filter((p) => !p.sameTab && p.presence?.mm && p.presence.mm.mode === myHost.host.mode && p.presence.mm.ph === 'lobby' && p.presence.mm.n < p.presence.mm.cap);
+  const rivals = room.peers().filter((p) => !p.sameTab && p.presence?.mm && p.presence.mm.mode === myHost.host.game + ':' + myHost.host.mode && p.presence.mm.ph === 'lobby' && p.presence.mm.n < p.presence.mm.cap);
   const winner = rivals.find((p) => me && p.peer < me.peer);
   return winner ? winner.presence.mm.code : null;
 }
