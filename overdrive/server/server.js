@@ -12,9 +12,10 @@
 
 import http from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { attachWebSocket } from './ws.js';
+import { attachWebSocket, Prepared } from './ws.js';
 import { MatchHost } from '../shared/host.js';
 import { PHYSICS, NET, MODES, GAME_MODES, ARENA_VARIANTS, arenasForMode } from '../shared/config.js';
 import { validateClientMsg, CODE_RE, makeCode } from '../shared/protocol.js';
@@ -44,7 +45,7 @@ const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; cha
 export function startServer(opts = {}) {
   const cfg = { ...parseArgs([]), ...opts };
   const sessions = new Map(); // code -> session record
-  const stats = { connections: 0, ticks: 0, tickMs: 0, maxTickMs: 0, msgsIn: 0, msgsOut: 0, rejected: 0 };
+  const stats = { connections: 0, ticks: 0, tickMs: 0, maxTickMs: 0, msgsIn: 0, msgsOut: 0, rejected: 0, disconnects: 0, closedBytesOut: 0, errors: 0, skippedSnaps: 0, behindMs: 0 };
   let connSeq = 0;
 
   setLogSink((e) => { if (!cfg.quiet) process.stdout.write(JSON.stringify(e) + '\n'); });
@@ -79,15 +80,18 @@ export function startServer(opts = {}) {
   });
 
   function route(rec, target, msg) {
-    if (target !== null && !rec.conns.has(target) && rec.joining && msg.t === 'welcome') {
+    if (target !== null && rec.joining && msg.t === 'welcome') {
+      // the joining socket takes over this player (also on reconnect, replacing a stale socket)
+      const old = rec.conns.get(target);
       rec.conns.set(target, rec.joining); rec.joining.pid = target;
+      if (old && old !== rec.joining) { old.rec = null; old.ws.terminate('replaced'); }
     }
-    let text = null;
+    let prep = null; // encoded (and compressed) once, however many players receive it
     if (target === null) {
-      for (const c of rec.conns.values()) { text ??= JSON.stringify(msg); deliver(c, text, msg.t); }
+      for (const c of rec.conns.values()) { prep ??= new Prepared(JSON.stringify(msg)); deliver(c, prep, msg.t); }
     } else {
       const c = rec.conns.get(target);
-      if (c) deliver(c, JSON.stringify(msg), msg.t);
+      if (c) deliver(c, new Prepared(JSON.stringify(msg)), msg.t);
     }
   }
 
@@ -97,12 +101,19 @@ export function startServer(opts = {}) {
     if (cfg.loss && Math.random() < cfg.loss) d += cfg.lag + 30; // TCP retransmit-like stall
     return d;
   }
+  // Backpressure: a client that can't keep up (slow or stalled connection) skips snapshots and
+  // stats, which are latest-state and safe to drop, instead of the server buffering them in RAM.
+  const SKIPPABLE = new Set(['snap', 'stats']);
   function deliver(c, text, type) {
+    if (!c.ws.open) return;
+    const queued = c.ws.socket.writableLength || 0;
+    if (queued > 8 * 1024 * 1024) { log('net', 'client too slow; disconnecting', { id: c.id, pid: c.pid, queued }); c.ws.terminate('slow_client'); return; }
+    if (queued > 96 * 1024 && SKIPPABLE.has(type)) { c.skipped++; stats.skippedSnaps++; return; }
     stats.msgsOut++;
-    if (!cfg.lag && !cfg.jitter && !cfg.loss) return c.ws.send(text);
+    if (!cfg.lag && !cfg.jitter && !cfg.loss) return c.ws.sendPrepared(text);
     const at = Math.max(c.outReady, performance.now() + delayFor(c)); // order preserved, like TCP
     c.outReady = at;
-    setTimeout(() => c.ws.open && c.ws.send(text), at - performance.now());
+    setTimeout(() => c.ws.open && c.ws.sendPrepared(text), at - performance.now());
   }
   function inbound(c, fn) {
     if (!cfg.lag && !cfg.jitter && !cfg.loss) return fn();
@@ -114,15 +125,20 @@ export function startServer(opts = {}) {
   // ------------------------------------------------------------- connections
   function onConnection(ws, req, url) {
     stats.connections++;
-    const c = { id: ++connSeq, ws, rec: null, pid: 0, op: url.searchParams.get('op') || 'queue', url, msgTimes: [], violations: 0, outReady: 0, inReady: 0, pingAt: 0 };
+    const c = { id: ++connSeq, ws, rec: null, pid: 0, op: url.searchParams.get('op') || 'queue', url, msgTimes: [], violations: 0, outReady: 0, inReady: 0, pingAt: 0, lastHeard: performance.now(), skipped: 0 };
     log('net', 'connection', { id: c.id, op: c.op, ip: req.socket.remoteAddress });
-    ws.on('message', (text, size) => inbound(c, () => onMessage(c, text, size)));
-    ws.on('pong', () => { if (c.rec && c.pid) c.rec.host.setPing(c.pid, Math.round(performance.now() - c.pingAt)); });
-    ws.on('close', (reason) => {
+    // one player's bad message or a bug in a session must never take the whole server down
+    const guard = (what, fn) => { try { fn(); } catch (e) { stats.errors++; log('server', what + ' failed', { id: c.id, pid: c.pid, err: String(e.stack || e) }); } };
+    ws.on('message', (text, size) => { c.lastHeard = performance.now(); inbound(c, () => guard('message', () => onMessage(c, text, size))); });
+    ws.on('pong', () => { c.lastHeard = performance.now(); guard('pong', () => { if (c.rec && c.pid) c.rec.host.setPing(c.pid, Math.round(performance.now() - c.pingAt)); }); });
+    ws.on('close', (reason) => guard('close', () => {
       log('net', 'disconnect', { id: c.id, pid: c.pid, reason });
+      stats.disconnects++; stats.closedBytesOut += ws.bytesOut;
       matchmaker.cancel(c);
-      if (c.rec && c.pid) { c.rec.conns.delete(c.pid); c.rec.host.disconnect(c.pid); }
-    });
+      // only the connection that currently owns the player may disconnect it: after a quick
+      // reconnect the old socket often closes later, and must not knock the new one offline
+      if (c.rec && c.pid && c.rec.conns.get(c.pid) === c) { c.rec.conns.delete(c.pid); c.rec.host.disconnect(c.pid); }
+    }));
   }
 
   function reject(c, code, msg) {
@@ -132,6 +148,7 @@ export function startServer(opts = {}) {
   }
 
   function onMessage(c, text, size) {
+    if (!c.ws.open) return; // arrived after the socket closed (e.g. a delayed join): would create a ghost
     stats.msgsIn++;
     const now = performance.now();
     c.msgTimes.push(now);
@@ -169,10 +186,25 @@ export function startServer(opts = {}) {
     rec.joining = null;
     if (res.error) return reject(c, res.error, res.error === 'full' ? 'That match is full.' : 'That match has ended.');
     c.rec = rec; c.pid = res.pid;
+    const old = rec.conns.get(res.pid);
     rec.conns.set(res.pid, c);
+    if (old && old !== c) { old.rec = null; old.ws.terminate('replaced'); } // reconnected: drop the stale socket
   }
 
   // ------------------------------------------------------------- http
+  const fileCache = new Map(); // path -> {mtime, body, gz, etag, type}
+  async function staticFile(file) {
+    const st = await stat(file).catch(() => null);
+    if (!st || !st.isFile()) return null;
+    const hit = fileCache.get(file);
+    if (hit && hit.mtime === st.mtimeMs) return hit;
+    const body = await readFile(file);
+    const type = MIME[path.extname(file)] || 'application/octet-stream';
+    const gz = /text|javascript|json|svg/.test(type) && body.length > 512 ? zlib.gzipSync(body, { level: 9 }) : null;
+    const ent = { mtime: st.mtimeMs, body, gz, type, etag: '"' + st.size.toString(36) + '-' + Math.round(st.mtimeMs).toString(36) + '"' };
+    fileCache.set(file, ent);
+    return ent;
+  }
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x');
@@ -181,6 +213,9 @@ export function startServer(opts = {}) {
           ok: true, sessions: sessions.size, players: [...sessions.values()].reduce((a, s) => a + s.host.connectedHumans().length, 0),
           tickRate: PHYSICS.tickRate, snapshotRate: cfg.snapshotRate, avgTickMs: stats.ticks ? +(stats.tickMs / stats.ticks).toFixed(3) : 0,
           maxTickMs: +stats.maxTickMs.toFixed(3), lag: cfg.lag, jitter: cfg.jitter, loss: cfg.loss,
+          cpu: process.cpuUsage(), rss: process.memoryUsage().rss, bytesOut: [...sessions.values()].reduce((a, r) => a + [...r.conns.values()].reduce((b, c) => b + c.ws.bytesOut, 0), 0) + stats.closedBytesOut,
+          sockets: [...sessions.values()].reduce((a, r) => a + [...r.conns.values()].filter((c) => c.ws.open).length, 0),
+          kicked: stats.rejected, disconnects: stats.disconnects, errors: stats.errors, skippedSnaps: stats.skippedSnaps, behindMs: Math.round(stats.behindMs),
           list: [...sessions.values()].map((s) => ({ code: s.host.isPrivate ? 'private' : s.code, mode: s.host.mode, game: s.host.game, arena: s.host.arena, phase: s.host.phase, humans: s.host.connectedHumans().length })),
         };
         res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
@@ -191,10 +226,16 @@ export function startServer(opts = {}) {
       const file = path.resolve(ROOT, '.' + p);
       const allowed = ['client', 'shared', 'vendor'].some((d) => file.startsWith(path.join(ROOT, d) + path.sep));
       if (!allowed) { res.writeHead(404); return res.end('not found'); }
-      const st = await stat(file).catch(() => null);
-      if (!st || !st.isFile()) { res.writeHead(404); return res.end('not found'); }
-      res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream', 'cache-control': 'no-cache' });
-      res.end(await readFile(file));
+      const ent = await staticFile(file);
+      if (!ent) { res.writeHead(404); return res.end('not found'); }
+      // files are cached in memory and gzipped once; browsers revalidate with the ETag and get a
+      // tiny 304 when nothing changed, instead of re-downloading ~1 MB on every visit
+      const headers = { 'content-type': ent.type, 'cache-control': 'no-cache', etag: ent.etag, vary: 'accept-encoding' };
+      if (req.headers['if-none-match'] === ent.etag) { res.writeHead(304, headers); return res.end(); }
+      const gz = ent.gz && /\bgzip\b/.test(req.headers['accept-encoding'] || '');
+      if (gz) headers['content-encoding'] = 'gzip';
+      res.writeHead(200, headers);
+      res.end(req.method === 'HEAD' ? undefined : gz ? ent.gz : ent.body);
     } catch (e) {
       log('server', 'http error', { err: String(e) });
       res.writeHead(500); res.end('error');
@@ -207,7 +248,9 @@ export function startServer(opts = {}) {
   function loop() {
     if (!running) return;
     const now = performance.now();
-    acc += Math.min(now - last, 250) / 1000;
+    const gap = now - last;
+    if (gap > 250) stats.behindMs += gap - 250; // the host was starved of CPU; drop the backlog instead of spiralling
+    acc += Math.min(gap, 250) / 1000;
     last = now;
     while (acc >= PHYSICS.dt) {
       acc -= PHYSICS.dt;
@@ -221,11 +264,17 @@ export function startServer(opts = {}) {
     matchmaker.update();
     if (now - pingT > 2000) {
       pingT = now;
-      for (const rec of sessions.values()) for (const c of rec.conns.values()) { c.pingAt = performance.now(); c.ws.ping(); }
+      for (const rec of sessions.values()) for (const c of rec.conns.values()) {
+        // a peer that vanished without closing (phone lost signal, laptop lid shut) is cut after 15 s,
+        // so its car goes to a bot and nothing keeps queueing for it
+        if (now - c.lastHeard > 15000) { log('net', 'peer timed out', { id: c.id, pid: c.pid }); c.ws.terminate('timeout'); continue; }
+        c.pingAt = performance.now(); c.ws.ping();
+      }
     }
-    // sleep until the next tick is due (keeps CPU low on small instances)
-    const wait = Math.max(0, (PHYSICS.dt - acc) * 1000 - 1);
-    setTimeout(loop, sessions.size ? Math.min(wait, 8) : 20);
+    // wake about 60 times a second and run the ticks that are due (two per wake at 120 Hz);
+    // fewer wakeups is much cheaper on small shared-CPU hosts and is invisible at 20 Hz snapshots
+    const wait = Math.max(1, (PHYSICS.dt * 2 - acc) * 1000);
+    setTimeout(loop, sessions.size ? Math.min(wait, 17) : 50);
   }
   loop();
 
@@ -243,4 +292,8 @@ export function startServer(opts = {}) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   startServer(parseArgs(process.argv.slice(2)));
+  for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(0));
+  // last line of defence: log and keep serving rather than dropping every match on the server
+  process.on('uncaughtException', (e) => log('server', 'uncaught exception', { err: String(e.stack || e) }));
+  process.on('unhandledRejection', (e) => log('server', 'unhandled rejection', { err: String(e?.stack || e) }));
 }

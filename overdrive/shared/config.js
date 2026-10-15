@@ -196,8 +196,10 @@ export const MODES = {
 };
 
 export const NET = {
-  snapshotRate: 30,         // snapshots per second from the authority
-  inputRedundancy: 8,       // recent inputs repeated in every input packet (packet-loss resilience)
+  snapshotRate: 20,         // snapshots per second from the authority (clients predict in between)
+  inputRedundancy: 12,       // recent inputs repeated in every input packet (packet-loss resilience)
+  inputSendEvery: 4,        // ticks per input packet (30 packets/s at 120 Hz)
+  maxResimTicks: 96,        // client re-simulates at most this many unacknowledged ticks per snapshot (800 ms)
   maxInputQueue: 24,        // server-side per-player input buffer (ticks)
   targetInputQueue: 2,      // ticks of jitter buffer the server tries to keep
   disconnectGrace: 60,      // s a disconnected player's slot is held for reconnection

@@ -475,8 +475,10 @@ const MODES = {
 };
 
 const NET = {
-  snapshotRate: 30,         // snapshots per second from the authority
-  inputRedundancy: 8,       // recent inputs repeated in every input packet (packet-loss resilience)
+  snapshotRate: 20,         // snapshots per second from the authority (clients predict in between)
+  inputRedundancy: 12,       // recent inputs repeated in every input packet (packet-loss resilience)
+  inputSendEvery: 4,        // ticks per input packet (30 packets/s at 120 Hz)
+  maxResimTicks: 96,        // client re-simulates at most this many unacknowledged ticks per snapshot (800 ms)
   maxInputQueue: 24,        // server-side per-player input buffer (ticks)
   targetInputQueue: 2,      // ticks of jitter buffer the server tries to keep
   disconnectGrace: 60,      // s a disconnected player's slot is held for reconnection
@@ -719,9 +721,12 @@ class Arena {
     let d = -this.bowl(x, y, z, floorY);
     if (this.mode === 'soccar') {
       const a = this.p, g = a.goalCurve;
+      const bz = Math.abs(Math.abs(z) - this.goalCZ) - (this.goalHZ - g);
+      // the goal box can only matter if it is closer than the bowl surface (exact early-out:
+      // the box's distance is at least its z-separation)
+      if (bz >= g - d) return d;
       const bx = Math.abs(x) - (this.goalHalfW - g);
       const by = Math.abs(y - a.goalHeight / 2) - (a.goalHeight / 2 - g);
-      const bz = Math.abs(Math.abs(z) - this.goalCZ) - (this.goalHZ - g);
       const obx = bx > 0 ? bx : 0, oby = by > 0 ? by : 0, obz = bz > 0 ? bz : 0;
       const dGoal = Math.sqrt(obx * obx + oby * oby + obz * obz) + Math.min(Math.max(bx, Math.max(by, bz)), 0) - g;
       if (-dGoal > d) d = -dGoal;
@@ -2220,7 +2225,7 @@ class ClientSession {
     this.closed = null;
     this.error = null;
     this.redundancy = inputRedundancy || NET.inputRedundancy;
-    this.sendEvery = sendEvery || 2;
+    this.sendEvery = sendEvery || NET.inputSendEvery || 2;
     this.smooth = new Map(); // id -> {off: V3, rot: Quat|null, rt}
     this.ballOff = new V3();
     this.prev = new Map();   // per-tick previous positions for render interpolation
@@ -2243,7 +2248,9 @@ class ClientSession {
         break;
       case 'lobby': if (!this.lobby || m.v >= this.lobby.v || m.phase !== this.lobby.phase) this.lobby = m; break;
       case 'start': this.onStart(m); break;
-      case 'snap': this.onSnap(m); break;
+      // keep only the newest snapshot; it is applied once per frame in update(). When the network
+      // stalls and several arrive together, re-simulating for each one would freeze the tab.
+      case 'snap': if (Array.isArray(m.s) && (!this.snapIn || m.s[0] > this.snapIn.s[0])) { this.snapIn = m; this.snapCount++; } break;
       case 'stats':
         if (m.mid === this.mid) { this.stats = m.stats; this.pings = m.ping; this.conn_ = m.conn; this.roster = m.roster; }
         break;
@@ -2258,6 +2265,7 @@ class ClientSession {
   }
 
   onStart(m) {
+    this.snapIn = null;
     if (this.world && m.mid === this.mid) return;
     this.mid = m.mid; this.mode = m.mode; this.roster = m.roster; this.result = null;
     this.arenaId = ARENA_VARIANTS[m.arena] ? m.arena : 'stadium';
@@ -2275,7 +2283,6 @@ class ClientSession {
     const snap = m.s;
     if (!Array.isArray(snap) || snap[0] <= this.lastSnapTick) return; // out of order / duplicate
     this.lastSnapTick = snap[0];
-    this.snapCount++;
     // remember where things are drawn now, to smooth the correction
     const before = new Map();
     for (const c of w.cars) before.set(c.id, { p: c.pos.clone(), q: c.rot.clone() });
@@ -2286,7 +2293,10 @@ class ClientSession {
     const authDemoSeq = w.demoSeq || 0, authDemo = w.lastDemo;
     const ack = m.a && Number.isInteger(m.a[this.pid]) ? m.a[this.pid] : -1;
     if (ack >= 0) while (this.pending.length && this.pending[0].seq <= ack) this.pending.shift();
-    // re-simulate inputs the authority has not processed yet
+    // re-simulate inputs the authority has not processed yet (bounded: under a long stall only the
+    // most recent inputs are replayed, so a lag spike can't turn into hundreds of physics steps)
+    const maxResim = NET.maxResimTicks || 96;
+    if (this.pending.length > maxResim) { this.resimCapped = (this.resimCapped || 0) + 1; this.pending.splice(0, this.pending.length - maxResim); }
     w.emitEvents = false;
     const me = w.car(this.pid);
     for (const p of this.pending) {
@@ -2356,6 +2366,7 @@ class ClientSession {
   update(realDt, input) {
     const now = this.now();
     if (now - this.lastPing > 1000) { this.lastPing = now; this.send({ t: 'ping', c: now }); }
+    if (this.snapIn) { const m = this.snapIn; this.snapIn = null; this.onSnap(m); }
     const w = this.world;
     if (!w || this.closed) return 0;
     const q = quantizeInput(input || neutralInput());
@@ -2904,7 +2915,7 @@ class MatchHost {
     const p = {
       pid, name: cleanName(name), cos: sanitizeCosmetics(cos), team, ready: false, bot: false, connected: true,
       token: Math.floor(this.rand() * 2 ** 52).toString(36) + Math.floor(this.rand() * 2 ** 52).toString(36),
-      queue: [], lastSeq: -1, lastQueued: -1, lastInput: neutralInput(), discTicks: 0, botCtl: null, ping: 0,
+      queue: [], lastSeq: -1, lastQueued: -1, lastArrival: -1, gapMax: 0, lastInput: neutralInput(), discTicks: 0, botCtl: null, ping: 0,
       chatTicks: 0, rematch: false, left: false, violations: 0,
     };
     this.players.set(pid, p);
@@ -3012,6 +3023,10 @@ class MatchHost {
   onInput(p, m) {
     if (!this.world || this.phase !== 'match') return;
     // accept only inputs newer than anything already queued; old/duplicate ones are stale
+    // track how bursty this player's packets are, so the jitter buffer can hold enough inputs to
+    // bridge the gaps instead of dropping inputs the client already predicted (= rubber-banding)
+    if (p.lastArrival >= 0) { const gap = this.phaseTicks - p.lastArrival; p.gapMax = Math.max(gap, (p.gapMax || 0) * 0.97); }
+    p.lastArrival = this.phaseTicks;
     for (let k = 0; k < m.i.length; k++) {
       const seq = m.s + k;
       if (seq <= p.lastQueued) continue;
@@ -3061,7 +3076,7 @@ class MatchHost {
     this.world = new World({ seed, duration: this.duration, arenaParams: this.arenaParams });
     for (const p of [...this.players.values()].sort((a, b) => a.pid - b.pid)) {
       this.world.addCar(p.pid, p.team);
-      p.queue = []; p.lastSeq = -1; p.lastQueued = -1; p.rematch = false; p.ready = false;
+      p.queue = []; p.lastSeq = -1; p.lastQueued = -1; p.lastArrival = -1; p.gapMax = 0; p.rematch = false; p.ready = false;
     }
     this.world.startMatch();
     this.phase = 'match';
@@ -3114,7 +3129,8 @@ class MatchHost {
       }
       if (!p.connected) { w.setInput(p.pid, neutralInput()); continue; }
       // jitter buffer: consume one input per tick; catch up when the queue grows
-      if (p.queue.length > NET.targetInputQueue + 4) p.queue.shift().seq;
+      const hold = Math.min(NET.maxInputQueue - 2, Math.max(NET.targetInputQueue + 4, Math.ceil(p.gapMax || 0) + 3));
+      if (p.queue.length > hold) p.queue.shift();
       const next = p.queue.shift();
       if (next) { p.lastInput = next.inp; p.lastSeq = next.seq; }
       w.setInput(p.pid, p.lastInput);
@@ -7783,6 +7799,10 @@ class App {
   // ------------------------------------------------------------------ sessions
   beginClient(conn, info = {}) {
     this.endSession(true);
+    // free hosts (e.g. Render) can idle a service that sees no new HTTP requests; a tiny request
+    // every few minutes during online play keeps the server awake mid-match
+    clearInterval(this.keepAliveT);
+    if (info.via === 'server' && /^https?:/.test(location.protocol)) this.keepAliveT = setInterval(() => { if (this.session) fetch('/status', { cache: 'no-store' }).catch(() => {}); }, 240000);
     const S = new ClientSession({ conn, name: this.profile.name, cos: this.profile.cosmetics(), token: info.token || null });
     conn.attach?.(S);
     this.session = S;

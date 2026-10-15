@@ -4,6 +4,17 @@ An original rocket-car football game: drive, boost, jump, dodge and fly to put a
 
 Everything except the three.js renderer (MIT) was written for this project: simulation, networking, WebSocket server, bots, procedural cars/arenas, synthesised audio and UI. No third-party game assets.
 
+## Update 4: stability and performance (10+ players, high ping)
+
+- **The server can't be taken down by one player any more**: errors in a message, a session or a disconnect are caught and logged; uncaught errors no longer kill the process (which dropped every match).
+- **Reconnect race fixed**: on a bad connection the browser could reconnect before the server noticed the old socket died; when the old one closed it knocked the player offline and their game froze. Only the socket that currently owns a player can disconnect it now, and a reconnect replaces the stale socket.
+- **No more ghost players** filling lobbies (join messages arriving after their socket closed).
+- **Slow/dead connections**: players who can't keep up skip snapshots instead of the server buffering for them; silent drop-outs are cut after 15 s and a bot takes over.
+- **Client can't freeze under lag**: only the newest snapshot is applied per frame, and re-simulation is capped, so a lag spike can't turn into hundreds of physics steps in one frame.
+- **Adaptive jitter buffer**: the server holds enough inputs to bridge each player's packet gaps instead of dropping inputs (rubber-banding).
+- **Lighter on small hosts**: 20 snapshots/s (was 30), inputs 30 packets/s (was 60), 60 server wake-ups/s (was 120+), WebSocket compression (permessage-deflate): 10 players went from ~271 KB/s to ~73 KB/s outgoing. Game files are cached and gzipped in memory with ETags (three.js 670 KB → 167 KB, repeat visits are a 304).
+- Online clients ping the server every 4 minutes so free hosts don't idle it mid-match.
+
 ## Update 3: modes, maps, visuals
 
 - **Game modes**: Soccar, **Hoops** (smaller court, raised rims on the back walls, the ball has to drop through the rim) and **Dropshot** (hexagonal arena, no goals: hits charge the ball through three levels, landings on the other side crack and then open floor tiles, and a ball through a hole scores). Pick the mode in Casual, Private Match and Practice; matchmaking queues per mode.
@@ -133,7 +144,7 @@ Needs external services (interfaces are in place, not deployed):
 ## Testing
 
 ```bash
-node --test tests/*.test.js     # 46 tests: physics, rules, bots, protocol, dedicated-server multiplayer, browser-host transport
+node --test tests/*.test.js     # 47 tests: physics, rules, bots, protocol, dedicated-server multiplayer, browser-host transport
 node server/server.js --port 8099 & python3 tests/ui_smoke.py http://localhost:8099/   # 21 browser UI checks (Playwright)
 ```
 

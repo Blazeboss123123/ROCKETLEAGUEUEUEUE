@@ -33,7 +33,7 @@ export class ClientSession {
     this.closed = null;
     this.error = null;
     this.redundancy = inputRedundancy || NET.inputRedundancy;
-    this.sendEvery = sendEvery || 2;
+    this.sendEvery = sendEvery || NET.inputSendEvery || 2;
     this.smooth = new Map(); // id -> {off: V3, rot: Quat|null, rt}
     this.ballOff = new V3();
     this.prev = new Map();   // per-tick previous positions for render interpolation
@@ -56,7 +56,9 @@ export class ClientSession {
         break;
       case 'lobby': if (!this.lobby || m.v >= this.lobby.v || m.phase !== this.lobby.phase) this.lobby = m; break;
       case 'start': this.onStart(m); break;
-      case 'snap': this.onSnap(m); break;
+      // keep only the newest snapshot; it is applied once per frame in update(). When the network
+      // stalls and several arrive together, re-simulating for each one would freeze the tab.
+      case 'snap': if (Array.isArray(m.s) && (!this.snapIn || m.s[0] > this.snapIn.s[0])) { this.snapIn = m; this.snapCount++; } break;
       case 'stats':
         if (m.mid === this.mid) { this.stats = m.stats; this.pings = m.ping; this.conn_ = m.conn; this.roster = m.roster; }
         break;
@@ -71,6 +73,7 @@ export class ClientSession {
   }
 
   onStart(m) {
+    this.snapIn = null;
     if (this.world && m.mid === this.mid) return;
     this.mid = m.mid; this.mode = m.mode; this.roster = m.roster; this.result = null;
     this.arenaId = ARENA_VARIANTS[m.arena] ? m.arena : 'stadium';
@@ -88,7 +91,6 @@ export class ClientSession {
     const snap = m.s;
     if (!Array.isArray(snap) || snap[0] <= this.lastSnapTick) return; // out of order / duplicate
     this.lastSnapTick = snap[0];
-    this.snapCount++;
     // remember where things are drawn now, to smooth the correction
     const before = new Map();
     for (const c of w.cars) before.set(c.id, { p: c.pos.clone(), q: c.rot.clone() });
@@ -99,7 +101,10 @@ export class ClientSession {
     const authDemoSeq = w.demoSeq || 0, authDemo = w.lastDemo;
     const ack = m.a && Number.isInteger(m.a[this.pid]) ? m.a[this.pid] : -1;
     if (ack >= 0) while (this.pending.length && this.pending[0].seq <= ack) this.pending.shift();
-    // re-simulate inputs the authority has not processed yet
+    // re-simulate inputs the authority has not processed yet (bounded: under a long stall only the
+    // most recent inputs are replayed, so a lag spike can't turn into hundreds of physics steps)
+    const maxResim = NET.maxResimTicks || 96;
+    if (this.pending.length > maxResim) { this.resimCapped = (this.resimCapped || 0) + 1; this.pending.splice(0, this.pending.length - maxResim); }
     w.emitEvents = false;
     const me = w.car(this.pid);
     for (const p of this.pending) {
@@ -169,6 +174,7 @@ export class ClientSession {
   update(realDt, input) {
     const now = this.now();
     if (now - this.lastPing > 1000) { this.lastPing = now; this.send({ t: 'ping', c: now }); }
+    if (this.snapIn) { const m = this.snapIn; this.snapIn = null; this.onSnap(m); }
     const w = this.world;
     if (!w || this.closed) return 0;
     const q = quantizeInput(input || neutralInput());

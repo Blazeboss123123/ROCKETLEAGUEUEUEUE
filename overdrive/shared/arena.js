@@ -89,9 +89,12 @@ export class Arena {
     let d = -this.bowl(x, y, z, floorY);
     if (this.mode === 'soccar') {
       const a = this.p, g = a.goalCurve;
+      const bz = Math.abs(Math.abs(z) - this.goalCZ) - (this.goalHZ - g);
+      // the goal box can only matter if it is closer than the bowl surface (exact early-out:
+      // the box's distance is at least its z-separation)
+      if (bz >= g - d) return d;
       const bx = Math.abs(x) - (this.goalHalfW - g);
       const by = Math.abs(y - a.goalHeight / 2) - (a.goalHeight / 2 - g);
-      const bz = Math.abs(Math.abs(z) - this.goalCZ) - (this.goalHZ - g);
       const obx = bx > 0 ? bx : 0, oby = by > 0 ? by : 0, obz = bz > 0 ? bz : 0;
       const dGoal = Math.sqrt(obx * obx + oby * oby + obz * obz) + Math.min(Math.max(bx, Math.max(by, bz)), 0) - g;
       if (-dGoal > d) d = -dGoal;

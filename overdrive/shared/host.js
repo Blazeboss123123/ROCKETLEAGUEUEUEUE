@@ -85,7 +85,7 @@ export class MatchHost {
     const p = {
       pid, name: cleanName(name), cos: sanitizeCosmetics(cos), team, ready: false, bot: false, connected: true,
       token: Math.floor(this.rand() * 2 ** 52).toString(36) + Math.floor(this.rand() * 2 ** 52).toString(36),
-      queue: [], lastSeq: -1, lastQueued: -1, lastInput: neutralInput(), discTicks: 0, botCtl: null, ping: 0,
+      queue: [], lastSeq: -1, lastQueued: -1, lastArrival: -1, gapMax: 0, lastInput: neutralInput(), discTicks: 0, botCtl: null, ping: 0,
       chatTicks: 0, rematch: false, left: false, violations: 0,
     };
     this.players.set(pid, p);
@@ -193,6 +193,10 @@ export class MatchHost {
   onInput(p, m) {
     if (!this.world || this.phase !== 'match') return;
     // accept only inputs newer than anything already queued; old/duplicate ones are stale
+    // track how bursty this player's packets are, so the jitter buffer can hold enough inputs to
+    // bridge the gaps instead of dropping inputs the client already predicted (= rubber-banding)
+    if (p.lastArrival >= 0) { const gap = this.phaseTicks - p.lastArrival; p.gapMax = Math.max(gap, (p.gapMax || 0) * 0.97); }
+    p.lastArrival = this.phaseTicks;
     for (let k = 0; k < m.i.length; k++) {
       const seq = m.s + k;
       if (seq <= p.lastQueued) continue;
@@ -242,7 +246,7 @@ export class MatchHost {
     this.world = new World({ seed, duration: this.duration, arenaParams: this.arenaParams });
     for (const p of [...this.players.values()].sort((a, b) => a.pid - b.pid)) {
       this.world.addCar(p.pid, p.team);
-      p.queue = []; p.lastSeq = -1; p.lastQueued = -1; p.rematch = false; p.ready = false;
+      p.queue = []; p.lastSeq = -1; p.lastQueued = -1; p.lastArrival = -1; p.gapMax = 0; p.rematch = false; p.ready = false;
     }
     this.world.startMatch();
     this.phase = 'match';
@@ -295,7 +299,8 @@ export class MatchHost {
       }
       if (!p.connected) { w.setInput(p.pid, neutralInput()); continue; }
       // jitter buffer: consume one input per tick; catch up when the queue grows
-      if (p.queue.length > NET.targetInputQueue + 4) p.queue.shift().seq;
+      const hold = Math.min(NET.maxInputQueue - 2, Math.max(NET.targetInputQueue + 4, Math.ceil(p.gapMax || 0) + 3));
+      if (p.queue.length > hold) p.queue.shift();
       const next = p.queue.shift();
       if (next) { p.lastInput = next.inp; p.lastSeq = next.seq; }
       w.setInput(p.pid, p.lastInput);

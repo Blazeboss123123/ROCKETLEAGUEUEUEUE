@@ -190,6 +190,10 @@ class App {
   // ------------------------------------------------------------------ sessions
   beginClient(conn, info = {}) {
     this.endSession(true);
+    // free hosts (e.g. Render) can idle a service that sees no new HTTP requests; a tiny request
+    // every few minutes during online play keeps the server awake mid-match
+    clearInterval(this.keepAliveT);
+    if (info.via === 'server' && /^https?:/.test(location.protocol)) this.keepAliveT = setInterval(() => { if (this.session) fetch('/status', { cache: 'no-store' }).catch(() => {}); }, 240000);
     const S = new ClientSession({ conn, name: this.profile.name, cos: this.profile.cosmetics(), token: info.token || null });
     conn.attach?.(S);
     this.session = S;
